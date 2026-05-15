@@ -1,0 +1,2 @@
+[shell_environment_policy.set]
+PERU_DNIE_LOG_LEVEL = "debug"

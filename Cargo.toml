@@ -1,0 +1,22 @@
+[package]
+name = "peru-dnie-pkcs11"
+version = "0.1.0"
+edition = "2024"
+rust-version = "1.85"
+license = "MIT OR Apache-2.0"
+description = "PKCS#11 module for Peruvian DNIe card-bound PDF signing"
+readme = "README.md"
+keywords = ["pkcs11", "smartcard", "dnie", "pdf", "signature"]
+categories = ["cryptography", "api-bindings"]
+build = "build.rs"
+
+[lib]
+name = "peru_dnie_pkcs11"
+crate-type = ["cdylib"]
+
+[dependencies]
+cryptoki-sys = "0.5.0"
+openssl = "0.10"
+pcsc = "2"
+sha2 = "0.10"
+zeroize = "1"

@@ -1,0 +1,57 @@
+{
+  "version": "0.2.0",
+  "configurations": [
+    {
+      "name": "Debug pkcs11-tool",
+      "type": "cppdbg",
+      "request": "launch",
+      "program": "/usr/bin/pkcs11-tool",
+      "preLaunchTask": "cargo build debug",
+      "args": [
+        "--module",
+        "${workspaceFolder}/target/debug/libperu_dnie_pkcs11.so",
+        "-O"
+      ],
+      "cwd": "${workspaceFolder}",
+      "environment": [
+        {
+          "name": "PERU_DNIE_LOG",
+          "value": "debug"
+        },
+        {
+          "name": "RUST_BACKTRACE",
+          "value": "1"
+        }
+      ],
+      "MIMode": "gdb",
+      "stopAtEntry": false,
+      "externalConsole": false
+    },
+    {
+      "name": "Debug pkcs11-tool list",
+      "type": "cppdbg",
+      "request": "launch",
+      "program": "/usr/bin/pkcs11-tool",
+      "preLaunchTask": "cargo build debug",
+      "args": [
+        "--module",
+        "${workspaceFolder}/target/debug/libperu_dnie_pkcs11.so",
+        "-L"
+      ],
+      "cwd": "${workspaceFolder}",
+      "environment": [
+        {
+          "name": "PERU_DNIE_LOG",
+          "value": "debug"
+        },
+        {
+          "name": "RUST_BACKTRACE",
+          "value": "1"
+        },
+      ],
+      "MIMode": "gdb",
+      "stopAtEntry": false,
+      "externalConsole": false
+    }
+  ]
+}

@@ -1,0 +1,1 @@
+prefix_rule(pattern=["pkcs11-tool"], decision="allow")
