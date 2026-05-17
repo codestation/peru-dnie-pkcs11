@@ -194,7 +194,7 @@ impl DnieCard {
             "PIN VERIFY begin: profile={}, pin_ref={pin_ref:02X}",
             self.profile_name()
         );
-        let (_, sw) = self.transmit(0x00, 0x20, 0x00, pin_ref, &pin_data, Some(0))?;
+        let (_, sw) = self.verify(pin_ref, &pin_data)?;
         if sw == 0x9000 {
             crate::log_info!("PIN VERIFY succeeded");
             self.pin_verified = true;
@@ -269,12 +269,13 @@ impl DnieCard {
             pso_data.len()
         );
         self.refresh_pin()?;
-        let (_, sw) = self.transmit(0x00, 0x22, 0x41, 0xB6, mse, None)?;
+        let (_, sw) = self.manage_security_environment(0x41, 0xB6, mse)?;
         if sw != 0x9000 {
             crate::log_warn!("MSE SET for signing failed: sw={sw:04X}");
             return Err(CardError::Card);
         }
-        let (plain, sw) = self.transmit(0x00, 0x2A, 0x9E, 0x9A, pso_data, Some(0))?;
+        let (plain, sw) =
+            self.perform_security_operation([0x9E, 0x9A], pso_data, Some(self.sign_le()))?;
         if sw != 0x9000 {
             crate::log_warn!("PSO SIGN failed: sw={sw:04X}");
             if sw == 0x6982 {
@@ -314,6 +315,32 @@ impl DnieCard {
         }
     }
 
+    fn sign_le(&self) -> u32 {
+        signing_response_le(self.secure_messaging.is_some())
+    }
+
+    fn verify(&mut self, pin_ref: u8, pin_data: &[u8]) -> CardResult<(Vec<u8>, u16)> {
+        self.transmit(0x00, 0x20, 0x00, pin_ref, pin_data, Some(0))
+    }
+
+    fn manage_security_environment(
+        &mut self,
+        p1: u8,
+        p2: u8,
+        data: &[u8],
+    ) -> CardResult<(Vec<u8>, u16)> {
+        self.transmit(0x00, 0x22, p1, p2, data, None)
+    }
+
+    fn perform_security_operation(
+        &mut self,
+        apdu_prefix: [u8; 2],
+        data: &[u8],
+        le: Option<u32>,
+    ) -> CardResult<(Vec<u8>, u16)> {
+        self.transmit(0x00, 0x2A, apdu_prefix[0], apdu_prefix[1], data, le)
+    }
+
     fn refresh_pin(&mut self) -> CardResult<()> {
         if self.cached_pin.is_empty() {
             return Err(CardError::NotLoggedIn);
@@ -324,7 +351,7 @@ impl DnieCard {
             self.profile_name()
         );
         let cached_pin = std::mem::take(&mut self.cached_pin);
-        let refresh_result = self.transmit(0x00, 0x20, 0x00, pin_ref, &cached_pin, Some(0));
+        let refresh_result = self.verify(pin_ref, &cached_pin);
         self.cached_pin = cached_pin;
         let (_, sw) = match refresh_result {
             Ok(result) => result,
@@ -1214,6 +1241,10 @@ fn read_binary_le(requested: u32, protected: bool) -> u32 {
     if protected { EXTENDED_LE } else { requested }
 }
 
+fn signing_response_le(protected: bool) -> u32 {
+    if protected { EXTENDED_LE } else { 0 }
+}
+
 fn connect_http(host: &str, port: &str) -> anyhow::Result<TcpStream> {
     let timeout = Duration::from_secs(5);
     let port = port
@@ -1315,6 +1346,12 @@ mod tests {
     fn uses_extended_le_for_protected_reads() {
         assert_eq!(read_binary_le(255, false), 255);
         assert_eq!(read_binary_le(255, true), EXTENDED_LE);
+    }
+
+    #[test]
+    fn uses_extended_le_only_for_protected_signing() {
+        assert_eq!(signing_response_le(false), 0);
+        assert_eq!(signing_response_le(true), EXTENDED_LE);
     }
 
     #[test]
