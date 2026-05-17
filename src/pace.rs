@@ -29,14 +29,6 @@ const BP256_A: &[u8] =
     &hex_bytes("7D5A0975FC2C3057EEF67530417AFFE7FB8055C126DC5C6CE94A4B44F330B5D9");
 const BP256_B: &[u8] =
     &hex_bytes("26DC5C6CE94A4B44F330B5D9BBD77CBF958416295CF7E1CE6BCCDC18FF8C07B6");
-const BP256_G: &[u8] = &sec1(
-    &hex_bytes("8BD2AEB9CB7E57CB2C4B482FFC81B7AFB9DE27E1E3BD23C23A4453BD9ACE3262"),
-    &hex_bytes("547EF835C3DAC4FD97F8461A14611DC9C27745132DED8E545C1D54C72F046997"),
-);
-const BP256_ORDER: &[u8] =
-    &hex_bytes("A9FB57DBA1EEA9BC3E660A909D838D718C397AA3B561A6F7901E0E82974856A7");
-const BP256_COFACTOR: &[u8] = &[0x01];
-
 #[derive(Clone)]
 pub struct SecureMessaging {
     k_enc: [u8; 32],
@@ -284,26 +276,74 @@ fn mse_set_at(card: &Card, info: &PaceInfo) -> Result<(), ()> {
 }
 
 fn perform_pace_im(card: &Card, can: &str, _info: &PaceInfo) -> Result<SecureMessaging, ()> {
+    let mut entropy = OsPaceEntropy;
+    perform_pace_im_with(card, can, &mut entropy)
+}
+
+trait PaceCard {
+    fn pace_general_authenticate(
+        &mut self,
+        cla: u8,
+        payload: Option<(u8, &[u8])>,
+        le: u32,
+        response_tag: u32,
+    ) -> Result<Vec<u8>, ()>;
+}
+
+impl PaceCard for &Card {
+    fn pace_general_authenticate(
+        &mut self,
+        cla: u8,
+        payload: Option<(u8, &[u8])>,
+        le: u32,
+        response_tag: u32,
+    ) -> Result<Vec<u8>, ()> {
+        general_authenticate(self, cla, payload, le, response_tag)
+    }
+}
+
+trait PaceEntropy {
+    fn nonce_t(&mut self) -> Result<[u8; 32], ()>;
+    fn private_scalar(&mut self) -> Result<Scalar, ()>;
+}
+
+struct OsPaceEntropy;
+
+impl PaceEntropy for OsPaceEntropy {
+    fn nonce_t(&mut self) -> Result<[u8; 32], ()> {
+        random_32()
+    }
+
+    fn private_scalar(&mut self) -> Result<Scalar, ()> {
+        random_scalar()
+    }
+}
+
+fn perform_pace_im_with<C: PaceCard, E: PaceEntropy>(
+    mut card: C,
+    can: &str,
+    entropy: &mut E,
+) -> Result<SecureMessaging, ()> {
     crate::log_info!("PACE IM begin: requesting encrypted nonce");
-    let enc_nonce = general_authenticate(card, 0x10, None, 0, 0x80)?;
+    let enc_nonce = card.pace_general_authenticate(0x10, None, 0, 0x80)?;
     crate::log_debug!("PACE IM encrypted nonce received: len={}", enc_nonce.len());
     crate::log_info!("PACE IM decrypting nonce with configured CAN");
     let nonce_s = decrypt_nonce(can, &enc_nonce)?;
     crate::log_debug!("PACE IM nonce decrypted: len={}", nonce_s.len());
-    let nonce_t = random_32()?;
+    let nonce_t = entropy.nonce_t()?;
     crate::log_info!("PACE IM nonce mapping exchange begin");
-    let _picc_mapping = general_authenticate(card, 0x10, Some((0x81, &nonce_t)), 0, 0x82)?;
+    let _picc_mapping = card.pace_general_authenticate(0x10, Some((0x81, &nonce_t)), 0, 0x82)?;
     crate::log_debug!("PACE IM nonce mapping exchange succeeded");
 
     crate::log_info!("PACE IM mapped generator derivation begin");
     let x = im_prf(&nonce_s, &nonce_t)?;
     let mapped_generator = icart_point_encode(&x)?;
     crate::log_debug!("PACE IM mapped generator derived");
-    let private_scalar = random_scalar()?;
+    let private_scalar = entropy.private_scalar()?;
     let pcd_point = mapped_generator * private_scalar;
     let pcd_pub = encode_point(&pcd_point.to_affine());
     crate::log_info!("PACE IM ephemeral public key exchange begin");
-    let picc_pub = general_authenticate(card, 0x10, Some((0x83, &pcd_pub)), 0, 0x84)?;
+    let picc_pub = card.pace_general_authenticate(0x10, Some((0x83, &pcd_pub)), 0, 0x84)?;
     if picc_pub.len() != 65 {
         crate::log_warn!(
             "PACE IM unexpected PICC public key length: len={}",
@@ -322,11 +362,11 @@ fn perform_pace_im(card: &Card, can: &str, _info: &PaceInfo) -> Result<SecureMes
     let pcd_token = auth_token(&k_mac, &picc_pub)?;
     let expected_picc_token = auth_token(&k_mac, &pcd_pub)?;
     crate::log_debug!(
-        "PACE IM authentication tokens computed: encoding=domain-parameters, token_len={}",
+        "PACE IM authentication tokens computed: encoding=public-key, token_len={}",
         pcd_token.len()
     );
     crate::log_info!("PACE IM authentication token exchange begin");
-    let picc_token = general_authenticate(card, 0, Some((0x85, &pcd_token)), 0, 0x86)?;
+    let picc_token = card.pace_general_authenticate(0, Some((0x85, &pcd_token)), 0, 0x86)?;
     if picc_token.ct_eq(&expected_picc_token).unwrap_u8() != 1 {
         crate::log_warn!(
             "PACE IM PICC authentication token verification failed: token_len={}",
@@ -456,12 +496,20 @@ fn im_prf(s: &[u8; 32], t: &[u8; 32]) -> Result<[u8; 32], ()> {
         0x9B, 0x6C, 0xBF, 0x06, 0x66, 0x77, 0xD0, 0xFA, 0xAE, 0x5A, 0xAD, 0xD9, 0x9D, 0xF8, 0xE5,
         0x35, 0x17,
     ];
-    let key = aes256_cbc_encrypt(t, &[0u8; 16], s)?;
-    let key: [u8; 32] = key.try_into().map_err(|_| ())?;
-    let next_key = aes256_cbc_encrypt(&key, &[0u8; 16], &C0)?;
-    let x = aes256_cbc_encrypt(&key, &[0u8; 16], &C1)?;
-    drop(next_key);
     let p = BigUint::from_bytes_be(BP256_P);
+    let mut key: [u8; 32] = aes256_cbc_encrypt(t, &[0u8; 16], s)?
+        .try_into()
+        .map_err(|_| ())?;
+    let needed = p.bits() + 64;
+    let mut x = Vec::new();
+    let mut n = 0;
+    while n * 256 < needed && x.len() + 32 <= 96 {
+        let next_key = aes256_cbc_encrypt(&key, &[0u8; 16], &C0)?;
+        let block = aes256_cbc_encrypt(&key, &[0u8; 16], &C1)?;
+        key.copy_from_slice(&next_key);
+        x.extend_from_slice(&block);
+        n += 1;
+    }
     let v = BigUint::from_bytes_be(&x) % p;
     Ok(fixed_32(&v))
 }
@@ -510,13 +558,7 @@ fn auth_token(k_mac: &[u8; 32], pubkey: &[u8]) -> Result<[u8; 8], ()> {
     let mut data = Vec::new();
     data.extend_from_slice(&[0x06, 0x0A]);
     data.extend_from_slice(PACE_ECDH_IM_AES_CBC_CMAC_256_OID);
-    append_tlv(&mut data, 0x81, BP256_P)?;
-    append_tlv(&mut data, 0x82, BP256_A)?;
-    append_tlv(&mut data, 0x83, BP256_B)?;
-    append_tlv(&mut data, 0x84, BP256_G)?;
-    append_tlv(&mut data, 0x85, BP256_ORDER)?;
     append_tlv(&mut data, 0x86, pubkey)?;
-    append_tlv(&mut data, 0x87, BP256_COFACTOR)?;
     let mut outer = Vec::new();
     outer.extend_from_slice(&[0x7F, 0x49]);
     append_ber_len(&mut outer, data.len())?;
