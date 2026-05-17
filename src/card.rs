@@ -316,7 +316,7 @@ impl DnieCard {
     }
 
     fn sign_le(&self) -> u32 {
-        signing_response_le(self.secure_messaging.is_some())
+        response_le(0, self.secure_messaging.is_some())
     }
 
     fn verify(&mut self, pin_ref: u8, pin_data: &[u8]) -> CardResult<(Vec<u8>, u16)> {
@@ -420,7 +420,7 @@ impl DnieCard {
         }
         let mut cert = Vec::new();
         let mut offset = 0usize;
-        let le = read_binary_le(255, self.secure_messaging.is_some());
+        let le = response_le(255, self.secure_messaging.is_some());
         loop {
             let offset_do = [0x54, 0x02, (offset >> 8) as u8, offset as u8];
             let (plain, sw) = self.transmit(0x00, 0xB1, 0x00, 0x00, &offset_do, Some(le))?;
@@ -503,7 +503,7 @@ impl DnieCard {
         let mut cert = Vec::new();
         let mut expected_total = None;
         let mut offset = 0usize;
-        let le = read_binary_le(le, self.secure_messaging.is_some());
+        let le = response_le(le, self.secure_messaging.is_some());
         loop {
             let (plain, sw) =
                 self.transmit(0x00, 0xB0, (offset >> 8) as u8, offset as u8, &[], Some(le))?;
@@ -1237,12 +1237,8 @@ fn parse_http_url(url: &str) -> anyhow::Result<(String, String, String)> {
     Ok((host.to_owned(), port.to_owned(), format!("/{path}")))
 }
 
-fn read_binary_le(requested: u32, protected: bool) -> u32 {
-    if protected { EXTENDED_LE } else { requested }
-}
-
-fn signing_response_le(protected: bool) -> u32 {
-    if protected { EXTENDED_LE } else { 0 }
+fn response_le(unprotected: u32, protected: bool) -> u32 {
+    if protected { EXTENDED_LE } else { unprotected }
 }
 
 fn connect_http(host: &str, port: &str) -> anyhow::Result<TcpStream> {
@@ -1344,14 +1340,14 @@ mod tests {
 
     #[test]
     fn uses_extended_le_for_protected_reads() {
-        assert_eq!(read_binary_le(255, false), 255);
-        assert_eq!(read_binary_le(255, true), EXTENDED_LE);
+        assert_eq!(response_le(255, false), 255);
+        assert_eq!(response_le(255, true), EXTENDED_LE);
     }
 
     #[test]
     fn uses_extended_le_only_for_protected_signing() {
-        assert_eq!(signing_response_le(false), 0);
-        assert_eq!(signing_response_le(true), EXTENDED_LE);
+        assert_eq!(response_le(0, false), 0);
+        assert_eq!(response_le(0, true), EXTENDED_LE);
     }
 
     #[test]
