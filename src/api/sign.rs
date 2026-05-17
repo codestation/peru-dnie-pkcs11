@@ -1,4 +1,5 @@
 use crate::{
+    card::CardError,
     ffi::{bytes_from_raw, mut_slice_from_raw, ptr_mut},
     objects,
     pkcs11::*,
@@ -191,11 +192,11 @@ fn sign_inner(
             );
             CKR_OK
         }
-        Err(-2) => {
+        Err(CardError::NotLoggedIn) => {
             crate::log_warn!("C_Sign failed: user not logged in");
             CKR_USER_NOT_LOGGED_IN
         }
-        Err(-5) => {
+        Err(CardError::BufferTooSmall) => {
             let Some(signature_len) = ptr_mut(signature_len) else {
                 return CKR_ARGUMENTS_BAD;
             };
@@ -204,7 +205,7 @@ fn sign_inner(
             CKR_BUFFER_TOO_SMALL
         }
         Err(err) => {
-            crate::log_warn!("C_Sign failed: internal_error={err}");
+            crate::log_warn!("C_Sign failed: internal_error={err:?}");
             CKR_FUNCTION_NOT_SUPPORTED
         }
     }

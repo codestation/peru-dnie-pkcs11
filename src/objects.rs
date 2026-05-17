@@ -1,4 +1,4 @@
-use crate::card::{CertObject, DnieCard};
+use crate::card::{CardResult, CertObject, DnieCard};
 use crate::ffi::{copy_to_raw, slice_from_raw};
 use crate::pkcs11::*;
 use std::mem;
@@ -12,7 +12,7 @@ static OBJECT_ID: [u8; 1] = [0x01];
 // Certificate and key objects share lazy loading rules, so callers can ask
 // this helper to populate only the material needed for the object they are
 // about to inspect.
-pub fn ensure_object_loaded(card: &mut DnieCard, object: CK_OBJECT_HANDLE) -> Result<(), i32> {
+pub fn ensure_object_loaded(card: &mut DnieCard, object: CK_OBJECT_HANDLE) -> CardResult<()> {
     if object == OBJECT_CERT || object == OBJECT_PRIVKEY {
         return card.ensure_signing_certificate();
     }

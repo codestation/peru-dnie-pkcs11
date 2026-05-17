@@ -1,4 +1,4 @@
-use crate::{ffi::bytes_from_raw, pkcs11::*};
+use crate::{card::CardError, ffi::bytes_from_raw, pkcs11::*};
 
 #[unsafe(no_mangle)]
 pub extern "C" fn C_Login(
@@ -22,8 +22,9 @@ pub extern "C" fn C_Login(
     };
     match card.login(pin) {
         Ok(()) => CKR_OK,
-        Err(-2) => CKR_TOKEN_NOT_RECOGNIZED,
-        _ => CKR_PIN_INCORRECT,
+        Err(CardError::NotPresent) => CKR_TOKEN_NOT_PRESENT,
+        Err(CardError::InvalidInput) | Err(CardError::PinIncorrect) => CKR_PIN_INCORRECT,
+        Err(_) => CKR_TOKEN_NOT_RECOGNIZED,
     }
 }
 

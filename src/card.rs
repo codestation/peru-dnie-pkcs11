@@ -3,7 +3,7 @@ use anyhow::{Context as AnyhowContext, anyhow, bail};
 use pcsc::{Card, Context, Protocols, Scope, ShareMode};
 use sha2::{Digest, Sha256};
 use std::{
-    env, fs,
+    env, fmt, fs,
     io::{Read, Write},
     net::{TcpStream, ToSocketAddrs},
     path::{Path, PathBuf},
@@ -46,11 +46,37 @@ const RSA_ENCRYPTION_OID: &str = "1.2.840.113549.1.1.1";
 /// DNIe generation detected by ATR or application selection probes.
 #[derive(Clone, Copy, Eq, PartialEq)]
 pub enum Profile {
-    Unknown,
-    V3,
-    V2,
     V1,
+    V2,
+    V3,
 }
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum CardError {
+    BufferTooSmall,
+    Card,
+    ChainUnavailable,
+    InvalidInput,
+    NotLoggedIn,
+    NotPresent,
+    PinIncorrect,
+}
+
+impl fmt::Display for CardError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str(match self {
+            Self::BufferTooSmall => "buffer too small",
+            Self::Card => "card error",
+            Self::ChainUnavailable => "certificate chain unavailable",
+            Self::InvalidInput => "invalid input",
+            Self::NotLoggedIn => "not logged in",
+            Self::NotPresent => "card not present",
+            Self::PinIncorrect => "PIN incorrect",
+        })
+    }
+}
+
+pub(crate) type CardResult<T> = Result<T, CardError>;
 
 /// PKCS#11-relevant certificate data extracted from an X.509 certificate.
 #[derive(Clone, Default)]
@@ -66,10 +92,11 @@ pub struct CertObject {
 /// The leaf signing certificate is loaded lazily. Intermediate certificates are
 /// loaded only immediately before signing, either from `PERU_DNIE_CERT_CHAIN`
 /// or from AIA discovery/cache policy.
+#[derive(Default)]
 pub struct DnieCard {
     pcsc: Option<Card>,
     pub present: bool,
-    pub profile: Profile,
+    pub profile: Option<Profile>,
     pub atr: Vec<u8>,
     pub pin_verified: bool,
     cached_pin: Vec<u8>,
@@ -82,26 +109,6 @@ pub struct DnieCard {
     secure_messaging: Option<pace::SecureMessaging>,
 }
 
-impl Default for DnieCard {
-    fn default() -> Self {
-        Self {
-            pcsc: None,
-            present: false,
-            profile: Profile::Unknown,
-            atr: Vec::new(),
-            pin_verified: false,
-            cached_pin: Vec::new(),
-            certificate: CertObject::default(),
-            chain: Vec::new(),
-            public_modulus: Vec::new(),
-            public_exponent: Vec::new(),
-            public_modulus_bits: 0,
-            token_serial: None,
-            secure_messaging: None,
-        }
-    }
-}
-
 impl Drop for DnieCard {
     fn drop(&mut self) {
         self.logout();
@@ -109,7 +116,7 @@ impl Drop for DnieCard {
 }
 
 impl DnieCard {
-    pub fn open() -> Result<Self, i32> {
+    pub fn open() -> CardResult<Self> {
         let cfg = config::load();
         crate::log_info!(
             "opening DNIe card: configured_chain_paths={}",
@@ -120,15 +127,16 @@ impl DnieCard {
         let mut card = Self::default();
         card.pcsc = Some(pcsc);
         card.present = true;
-        card.profile = profile;
+        card.profile = Some(profile);
         card.atr = atr;
         crate::log_info!("DNIe card connected");
         if let Some(can) = cfg.can.as_deref() {
             crate::log_info!("CAN configured; starting PACE");
-            let sm = pace::establish(card.pcsc.as_ref().ok_or(-1)?, can).map_err(|_| {
-                crate::log_warn!("PACE failed; refusing plaintext fallback");
-                -1
-            })?;
+            let sm =
+                pace::establish(card.pcsc.as_ref().ok_or(CardError::Card)?, can).map_err(|_| {
+                    crate::log_warn!("PACE failed; refusing plaintext fallback");
+                    CardError::Card
+                })?;
             card.secure_messaging = Some(sm);
             crate::log_info!("PACE secure messaging established");
         } else {
@@ -137,7 +145,7 @@ impl DnieCard {
         Ok(card)
     }
 
-    pub fn ensure_signing_certificate(&mut self) -> Result<(), i32> {
+    pub fn ensure_signing_certificate(&mut self) -> CardResult<()> {
         if !self.certificate.der.is_empty() {
             return Ok(());
         }
@@ -145,11 +153,10 @@ impl DnieCard {
             "loading DNIe signing certificate on demand: profile={}",
             self.profile_name()
         );
-        match self.profile {
+        match self.profile.ok_or(CardError::NotPresent)? {
             Profile::V1 => self.load_v1_certificate()?,
             Profile::V2 => self.load_v2_certificate()?,
             Profile::V3 => self.load_v3_certificate()?,
-            Profile::Unknown => return Err(-1),
         }
         crate::log_info!(
             "DNIe signing certificate loaded: bytes={}",
@@ -158,7 +165,7 @@ impl DnieCard {
         Ok(())
     }
 
-    pub fn ensure_token_serial(&mut self) -> Result<&str, i32> {
+    pub fn ensure_token_serial(&mut self) -> CardResult<&str> {
         if self.token_serial.is_none() {
             let serial = self
                 .read_dni_serial()
@@ -174,17 +181,14 @@ impl DnieCard {
         self.present = false;
     }
 
-    pub fn login(&mut self, pin: &[u8]) -> Result<(), i32> {
+    pub fn login(&mut self, pin: &[u8]) -> CardResult<()> {
         if !self.present {
-            return Err(-1);
+            return Err(CardError::NotPresent);
         }
-        self.select_signing_context().map_err(|_| -3)?;
-        let pin_data = self.pin_data(pin).ok_or(-3)?;
-        let pin_ref = match self.profile {
-            Profile::V2 => 0x81,
-            Profile::V1 => 0x04,
-            _ => 0x03,
-        };
+        self.select_signing_context()
+            .map_err(|_| CardError::PinIncorrect)?;
+        let pin_data = self.pin_data(pin).ok_or(CardError::InvalidInput)?;
+        let pin_ref = self.pin_ref()?;
         crate::log_info!(
             "PIN VERIFY begin: profile={}, pin_ref={pin_ref:02X}",
             self.profile_name()
@@ -197,10 +201,10 @@ impl DnieCard {
             Ok(())
         } else if sw & 0xfff0 == 0x63c0 {
             crate::log_warn!("PIN VERIFY failed with retries status: sw={sw:04X}");
-            Err(-4)
+            Err(CardError::PinIncorrect)
         } else {
             crate::log_warn!("PIN VERIFY failed: sw={sw:04X}");
-            Err(-3)
+            Err(CardError::PinIncorrect)
         }
     }
 
@@ -215,12 +219,12 @@ impl DnieCard {
         mechanism: u64,
         data: &[u8],
         sig: Option<&mut [u8]>,
-    ) -> Result<usize, i32> {
+    ) -> CardResult<usize> {
         if !self.present {
-            return Err(-1);
+            return Err(CardError::NotPresent);
         }
         if !self.pin_verified {
-            return Err(-2);
+            return Err(CardError::NotLoggedIn);
         }
         crate::log_info!(
             "card sign begin: profile={}, mechanism=0x{:X}, input_len={}, chain_count={}",
@@ -236,25 +240,25 @@ impl DnieCard {
             crate::log_debug!("signature length requested: bytes={out_len}");
             return Ok(out_len);
         };
-        let digest = digest_for_sign(mechanism, data).ok_or(-3)?;
+        let digest = digest_for_sign(mechanism, data).ok_or(CardError::InvalidInput)?;
         crate::log_debug!(
             "card sign digest prepared: digest_len={}, modulus_len={}",
             digest.len(),
             self.public_modulus.len()
         );
         let (mse, pso_data_storage);
-        let pso_data: &[u8] = match self.profile {
-            Profile::V2 => {
-                mse = V2_SIGN_MSE;
-                pso_data_storage = digest_info(&digest);
-                &pso_data_storage
-            }
+        let pso_data: &[u8] = match self.profile.ok_or(CardError::NotPresent)? {
             Profile::V1 => {
                 mse = LEGACY_SIGN_MSE;
                 pso_data_storage = digest_info(&digest);
                 &pso_data_storage
             }
-            _ => {
+            Profile::V2 => {
+                mse = V2_SIGN_MSE;
+                pso_data_storage = digest_info(&digest);
+                &pso_data_storage
+            }
+            Profile::V3 => {
                 mse = SIGN_MSE;
                 &digest
             }
@@ -263,36 +267,20 @@ impl DnieCard {
             "card sign PSO input prepared: pso_data_len={}",
             pso_data.len()
         );
+        self.refresh_pin()?;
         let (_, sw) = self.transmit(0x00, 0x22, 0x41, 0xB6, mse, None)?;
         if sw != 0x9000 {
             crate::log_warn!("MSE SET for signing failed: sw={sw:04X}");
-            return Err(-3);
+            return Err(CardError::Card);
         }
         let (plain, sw) = self.transmit(0x00, 0x2A, 0x9E, 0x9A, pso_data, Some(0))?;
-        if sw == 0x6982 {
-            // Okular can trigger a post-context-change sign attempt that returns
-            // 6982 unless the PIN is re-verified first.
-            self.refresh_pin()?;
-            let (_, sw) = self.transmit(0x00, 0x22, 0x41, 0xB6, mse, None)?;
-            if sw != 0x9000 {
-                crate::log_warn!("MSE SET after PIN refresh failed: sw={sw:04X}");
-                return Err(-2);
-            }
-            let (plain, sw) = self.transmit(0x00, 0x2A, 0x9E, 0x9A, pso_data, Some(0))?;
-            if sw != 0x9000 {
-                self.pin_verified = false;
-                crate::log_warn!("PSO SIGN after PIN refresh failed: sw={sw:04X}");
-                return Err(-2);
-            }
-            crate::log_info!(
-                "card sign complete after PIN refresh: signature_len={}",
-                plain.len()
-            );
-            return copy_signature(&plain, sig);
-        }
         if sw != 0x9000 {
             crate::log_warn!("PSO SIGN failed: sw={sw:04X}");
-            return Err(-3);
+            if sw == 0x6982 {
+                self.pin_verified = false;
+                return Err(CardError::NotLoggedIn);
+            }
+            return Err(CardError::Card);
         }
         crate::log_info!("card sign complete: signature_len={}", plain.len());
         copy_signature(&plain, sig)
@@ -300,37 +288,36 @@ impl DnieCard {
 
     pub(crate) fn profile_name(&self) -> &'static str {
         match self.profile {
-            Profile::Unknown => "unknown",
-            Profile::V3 => "v3",
-            Profile::V2 => "v2",
-            Profile::V1 => "v1",
+            Some(Profile::V1) => "v1",
+            Some(Profile::V2) => "v2",
+            Some(Profile::V3) => "v3",
+            None => "unknown",
         }
     }
 
-    fn select_signing_context(&mut self) -> Result<(), i32> {
-        match self.profile {
+    fn select_signing_context(&mut self) -> CardResult<()> {
+        match self.profile.ok_or(CardError::NotPresent)? {
+            Profile::V1 => {
+                let (_, sw) = self.transmit(0x00, 0xA4, 0x04, 0x00, LEGACY_PKI_AID, Some(0))?;
+                if sw == 0x9000 {
+                    Ok(())
+                } else {
+                    Err(CardError::Card)
+                }
+            }
+            Profile::V2 => self.select_adf_pki(),
             Profile::V3 => {
                 self.select_v3_ias_ecc_applet()?;
                 self.select_adf_pki()
             }
-            Profile::V2 => self.select_adf_pki(),
-            Profile::V1 => {
-                let (_, sw) = self.transmit(0x00, 0xA4, 0x04, 0x00, LEGACY_PKI_AID, Some(0))?;
-                if sw == 0x9000 { Ok(()) } else { Err(-1) }
-            }
-            Profile::Unknown => Err(-1),
         }
     }
 
-    fn refresh_pin(&mut self) -> Result<(), i32> {
+    fn refresh_pin(&mut self) -> CardResult<()> {
         if self.cached_pin.is_empty() {
-            return Err(-2);
+            return Err(CardError::NotLoggedIn);
         }
-        let pin_ref = match self.profile {
-            Profile::V2 => 0x81,
-            Profile::V1 => 0x04,
-            _ => 0x03,
-        };
+        let pin_ref = self.pin_ref()?;
         crate::log_info!(
             "PIN VERIFY refresh begin: profile={}, pin_ref={pin_ref:02X}",
             self.profile_name()
@@ -343,7 +330,7 @@ impl DnieCard {
             Err(e) => {
                 crate::log_warn!("PIN VERIFY refresh transmit failed: error={e}");
                 self.pin_verified = false;
-                return Err(-2);
+                return Err(CardError::NotLoggedIn);
             }
         };
         if sw == 0x9000 {
@@ -353,11 +340,19 @@ impl DnieCard {
         } else if sw & 0xfff0 == 0x63c0 {
             crate::log_warn!("PIN VERIFY refresh failed with retries status: sw={sw:04X}");
             self.pin_verified = false;
-            Err(-2)
+            Err(CardError::NotLoggedIn)
         } else {
             crate::log_warn!("PIN VERIFY refresh failed: sw={sw:04X}");
             self.pin_verified = false;
-            Err(-2)
+            Err(CardError::NotLoggedIn)
+        }
+    }
+
+    fn pin_ref(&self) -> CardResult<u8> {
+        match self.profile.ok_or(CardError::NotPresent)? {
+            Profile::V1 => Ok(0x04),
+            Profile::V2 => Ok(0x81),
+            Profile::V3 => Ok(0x03),
         }
     }
 
@@ -365,23 +360,22 @@ impl DnieCard {
         if pin.len() < 4 || pin.len() > 8 {
             return None;
         }
-        match self.profile {
-            Profile::V3 => {
-                let mut out = vec![0xff; 12];
-                out[..pin.len()].copy_from_slice(pin);
-                Some(out)
-            }
-            Profile::V2 => Some(pin.to_vec()),
+        match self.profile? {
             Profile::V1 => {
                 let mut out = vec![0xff; 8];
                 out[..pin.len()].copy_from_slice(pin);
                 Some(out)
             }
-            Profile::Unknown => None,
+            Profile::V2 => Some(pin.to_vec()),
+            Profile::V3 => {
+                let mut out = vec![0xff; 12];
+                out[..pin.len()].copy_from_slice(pin);
+                Some(out)
+            }
         }
     }
 
-    fn load_v3_certificate(&mut self) -> Result<(), i32> {
+    fn load_v3_certificate(&mut self) -> CardResult<()> {
         crate::log_debug!("loading v3 signing certificate");
         self.select_v3_ias_ecc_applet()?;
         self.select_adf_pki()?;
@@ -390,11 +384,11 @@ impl DnieCard {
         self.store_sign_certificate(&cert)
     }
 
-    fn load_v2_certificate(&mut self) -> Result<(), i32> {
+    fn load_v2_certificate(&mut self) -> CardResult<()> {
         self.select_adf_pki()?;
         let (_, sw) = self.transmit(0x00, 0xA4, 0x02, 0x04, V2_SIGN_CERT_ID, Some(0))?;
         if sw != 0x9000 {
-            return Err(-1);
+            return Err(CardError::Card);
         }
         let mut cert = Vec::new();
         let mut offset = 0usize;
@@ -405,10 +399,10 @@ impl DnieCard {
                 break;
             }
             if sw != 0x9000 && sw != 0x6282 {
-                return Err(-1);
+                return Err(CardError::Card);
             }
             if plain.len() < 4 {
-                return Err(-1);
+                return Err(CardError::Card);
             }
             cert.extend_from_slice(&plain[3..plain.len() - 1]);
             offset += plain.len() - 4;
@@ -416,29 +410,29 @@ impl DnieCard {
                 break;
             }
         }
-        self.profile = Profile::V2;
+        self.profile = Some(Profile::V2);
         self.store_sign_certificate(&cert)
     }
 
-    fn load_v1_certificate(&mut self) -> Result<(), i32> {
+    fn load_v1_certificate(&mut self) -> CardResult<()> {
         let (_, sw) = self.transmit(0x00, 0xA4, 0x04, 0x00, LEGACY_PKI_AID, Some(0))?;
         if sw != 0x9000 {
-            return Err(-1);
+            return Err(CardError::Card);
         }
         self.select_file(LEGACY_MF, 0x00, 0x00, "v1 MF")?;
         self.select_file(LEGACY_DF_PKI, 0x00, 0x00, "v1 DF PKI")?;
         self.select_file(LEGACY_SIGN_CERT_ID, 0x00, 0x00, "v1 signing certificate")?;
         let cert = self.read_binary_chunks(255, true)?;
-        self.profile = Profile::V1;
+        self.profile = Some(Profile::V1);
         self.store_sign_certificate(&cert)
     }
 
-    fn read_dni_serial(&mut self) -> Result<String, i32> {
+    fn read_dni_serial(&mut self) -> CardResult<String> {
         crate::log_debug!("reading token serial from DNI file");
         let (_, sw) = self.transmit(0x00, 0xA4, 0x02, 0x04, DNI_VALUE, Some(0))?;
         if sw != 0x9000 {
             crate::log_warn!("DNI file SELECT failed: sw={sw:04X}");
-            return Err(-1);
+            return Err(CardError::Card);
         }
         let bytes = self.read_binary_chunks(255, true)?;
         let serial = dni_serial_from_file(&bytes).unwrap_or_else(|| atr_serial_fallback(&self.atr));
@@ -446,37 +440,37 @@ impl DnieCard {
         Ok(serial)
     }
 
-    fn select_v3_ias_ecc_applet(&mut self) -> Result<(), i32> {
+    fn select_v3_ias_ecc_applet(&mut self) -> CardResult<()> {
         let (_, sw) = self.transmit(0x00, 0xA4, 0x04, 0x0C, APPLET_IDA_IAS_ECC, Some(0))?;
         if sw == 0x9000 {
             Ok(())
         } else {
             crate::log_warn!("Peru certificate applet SELECT failed: sw={sw:04X}");
-            Err(-1)
+            Err(CardError::Card)
         }
     }
 
-    fn select_adf_pki(&mut self) -> Result<(), i32> {
+    fn select_adf_pki(&mut self) -> CardResult<()> {
         let (_, sw) = self.transmit(0x00, 0xA4, 0x04, 0x04, ADF_PKI, Some(0))?;
         if sw == 0x9000 {
             Ok(())
         } else {
             crate::log_warn!("ADF PKI SELECT failed: sw={sw:04X}");
-            Err(-1)
+            Err(CardError::Card)
         }
     }
 
-    fn select_file(&mut self, fid: &[u8], p1: u8, p2: u8, label: &str) -> Result<(), i32> {
+    fn select_file(&mut self, fid: &[u8], p1: u8, p2: u8, label: &str) -> CardResult<()> {
         let (_, sw) = self.transmit(0x00, 0xA4, p1, p2, fid, Some(0))?;
         if sw == 0x9000 {
             Ok(())
         } else {
             crate::log_warn!("{label} SELECT failed: sw={sw:04X}");
-            Err(-1)
+            Err(CardError::Card)
         }
     }
 
-    fn read_binary_chunks(&mut self, le: u32, break_on_short: bool) -> Result<Vec<u8>, i32> {
+    fn read_binary_chunks(&mut self, le: u32, break_on_short: bool) -> CardResult<Vec<u8>> {
         let mut cert = Vec::new();
         let mut expected_total = None;
         let mut offset = 0usize;
@@ -485,13 +479,13 @@ impl DnieCard {
                 self.transmit(0x00, 0xB0, (offset >> 8) as u8, offset as u8, &[], Some(le))?;
             if sw != 0x9000 && sw != 0x6282 {
                 crate::log_warn!("READ BINARY failed: offset={offset}, sw={sw:04X}");
-                return Err(-1);
+                return Err(CardError::Card);
             }
             if plain.is_empty() {
                 crate::log_warn!(
                     "READ BINARY returned empty response: offset={offset}, sw={sw:04X}"
                 );
-                return Err(-1);
+                return Err(CardError::Card);
             }
             cert.extend_from_slice(&plain);
             if expected_total.is_none() && cert.len() >= 4 {
@@ -505,30 +499,30 @@ impl DnieCard {
                 break;
             }
             if offset > 0x7fff {
-                return Err(-1);
+                return Err(CardError::Card);
             }
         }
         Ok(cert)
     }
 
-    fn store_sign_certificate(&mut self, cert: &[u8]) -> Result<(), i32> {
+    fn store_sign_certificate(&mut self, cert: &[u8]) -> CardResult<()> {
         let Some(tlv) = tlv::parse_one(cert) else {
             crate::log_warn!("signing certificate is not valid BER-TLV");
-            return Err(-1);
+            return Err(CardError::Card);
         };
         if tlv.tag != 0x30 || tlv.value.is_empty() {
             crate::log_warn!("signing certificate TLV is not an X.509 sequence");
-            return Err(-1);
+            return Err(CardError::Card);
         }
         let der = &cert[..tlv.total_len];
         let obj = parse_cert_object(der).map_err(|err| {
             crate::log_warn!("parse signing certificate object failed: {err:#}");
-            -1
+            CardError::Card
         })?;
         let (modulus, exponent, modulus_bits) =
             parse_rsa_public_key_from_cert(der).map_err(|err| {
                 crate::log_warn!("parse signing certificate RSA public key failed: {err:#}");
-                -1
+                CardError::Card
             })?;
         self.public_modulus = modulus;
         self.public_exponent = exponent;
@@ -537,7 +531,7 @@ impl DnieCard {
         Ok(())
     }
 
-    pub(crate) fn ensure_chain_certs(&mut self) -> Result<(), i32> {
+    pub(crate) fn ensure_chain_certs(&mut self) -> CardResult<()> {
         if !self.chain.is_empty() {
             crate::log_debug!(
                 "certificate chain already available: count={}",
@@ -553,7 +547,7 @@ impl DnieCard {
         self.load_chain_certs_nonfatal(cfg.cert_chain);
         if self.chain.is_empty() {
             crate::log_error!("certificate chain unavailable; signing cannot continue");
-            return Err(-6);
+            return Err(CardError::ChainUnavailable);
         }
         crate::log_info!("certificate chain available: count={}", self.chain.len());
         Ok(())
@@ -597,19 +591,19 @@ impl DnieCard {
         }
     }
 
-    fn load_chain_cert(&mut self, path: &Path) -> Result<(), i32> {
+    fn load_chain_cert(&mut self, path: &Path) -> CardResult<()> {
         let bytes = fs::read(path)
             .with_context(|| format!("read certificate chain file {}", path.display()))
             .map_err(|err| {
                 crate::log_warn!("{err:#}");
-                -1
+                CardError::Card
             })?;
         self.load_chain_cert_bytes(&bytes).map_err(|err| {
             crate::log_warn!(
                 "parse certificate chain file {} failed: {err:#}",
                 path.display()
             );
-            -1
+            CardError::Card
         })
     }
 
@@ -632,10 +626,10 @@ impl DnieCard {
         }
     }
 
-    fn load_aia_url(&mut self, url: &str) -> Result<(), i32> {
+    fn load_aia_url(&mut self, url: &str) -> CardResult<()> {
         crate::log_info!("loading AIA issuer certificate: url={url}");
         if aia_cache_enabled() {
-            let cache_path = aia_cache_path(url).ok_or(-1)?;
+            let cache_path = aia_cache_path(url).ok_or(CardError::Card)?;
             crate::log_debug!("AIA cache path: {}", cache_path.display());
             if cache_path.exists() {
                 let before = self.chain.len();
@@ -658,7 +652,7 @@ impl DnieCard {
             crate::log_info!("AIA cache miss; downloading issuer certificate");
             let bytes = http_get(url).map_err(|err| {
                 crate::log_warn!("AIA issuer download failed: {err:#}");
-                -1
+                CardError::Card
             })?;
             let before = self.chain.len();
             if self.load_chain_cert_bytes(&bytes).is_ok() && self.chain.len() > before {
@@ -671,12 +665,12 @@ impl DnieCard {
                 return Ok(());
             }
             crate::log_warn!("downloaded AIA issuer certificate was not usable");
-            return Err(-1);
+            return Err(CardError::Card);
         }
         crate::log_info!("AIA cache disabled; downloading issuer certificate without caching");
         let bytes = http_get(url).map_err(|err| {
             crate::log_warn!("AIA issuer download failed: {err:#}");
-            -1
+            CardError::Card
         })?;
         let before = self.chain.len();
         if self.load_chain_cert_bytes(&bytes).is_ok() && self.chain.len() > before {
@@ -684,7 +678,7 @@ impl DnieCard {
             return Ok(());
         }
         crate::log_warn!("downloaded AIA issuer certificate was not usable");
-        Err(-1)
+        Err(CardError::Card)
     }
 
     fn load_chain_cert_bytes(&mut self, bytes: &[u8]) -> anyhow::Result<()> {
@@ -713,8 +707,8 @@ impl DnieCard {
         p2: u8,
         data: &[u8],
         le: Option<u32>,
-    ) -> Result<(Vec<u8>, u16), i32> {
-        let card = self.pcsc.as_ref().ok_or(-1)?;
+    ) -> CardResult<(Vec<u8>, u16)> {
+        let card = self.pcsc.as_ref().ok_or(CardError::NotPresent)?;
         let protected = self.secure_messaging.is_some();
         crate::log_debug!(
             "transmit begin: protected={}, cla={cla:02X}, ins={ins:02X}, p1={p1:02X}, p2={p2:02X}, data_len={}, le={}",
@@ -724,27 +718,28 @@ impl DnieCard {
                 .unwrap_or_else(|| "none".to_owned())
         );
         let apdu = if let Some(sm) = self.secure_messaging.as_mut() {
-            sm.wrap_apdu(cla, ins, p1, p2, data, le).map_err(|_| -1)?
+            sm.wrap_apdu(cla, ins, p1, p2, data, le)
+                .map_err(|_| CardError::Card)?
         } else {
-            apdu::encode(cla, ins, p1, p2, data, le).map_err(|_| -1)?
+            apdu::encode(cla, ins, p1, p2, data, le).map_err(|_| CardError::Card)?
         };
         let mut recv = [0u8; 8192];
         let rsp = match card.transmit(&apdu, &mut recv) {
             Ok(rsp) => rsp,
             Err(_) => {
                 crate::log_warn!("transmit PC/SC failed: ins={ins:02X}");
-                return Err(-1);
+                return Err(CardError::Card);
             }
         };
         let (plain, sw) = if let Some(sm) = self.secure_messaging.as_mut() {
             sm.unwrap_response(rsp).map_err(|_| {
                 crate::log_warn!("secure messaging response unwrap failed: ins={ins:02X}");
-                -1
+                CardError::Card
             })?
         } else {
             if rsp.len() < 2 {
                 crate::log_warn!("transmit failed: response shorter than status word");
-                return Err(-1);
+                return Err(CardError::Card);
             }
             let sw = u16::from_be_bytes([rsp[rsp.len() - 2], rsp[rsp.len() - 1]]);
             (rsp[..rsp.len() - 2].to_vec(), sw)
@@ -771,11 +766,13 @@ fn to_hex(bytes: &[u8]) -> String {
     out
 }
 
-fn find_peru_dnie() -> Result<(Card, Profile, Vec<u8>), i32> {
+fn find_peru_dnie() -> CardResult<(Card, Profile, Vec<u8>)> {
     crate::log_debug!("establishing PC/SC context");
-    let ctx = Context::establish(Scope::System).map_err(|_| -1)?;
+    let ctx = Context::establish(Scope::System).map_err(|_| CardError::Card)?;
     let mut readers_buf = [0; 2048];
-    let readers = ctx.list_readers(&mut readers_buf).map_err(|_| -1)?;
+    let readers = ctx
+        .list_readers(&mut readers_buf)
+        .map_err(|_| CardError::Card)?;
     crate::log_debug!("PC/SC readers listed");
     for reader in readers {
         crate::log_debug!("checking reader: {}", reader.to_string_lossy());
@@ -807,7 +804,7 @@ fn find_peru_dnie() -> Result<(Card, Profile, Vec<u8>), i32> {
         crate::log_debug!("card did not match Peru DNIe probes");
     }
     crate::log_warn!("no Peru DNIe card found");
-    Err(-1)
+    Err(CardError::NotPresent)
 }
 
 fn is_dnie_peru3(card: &Card) -> bool {
@@ -1057,9 +1054,9 @@ fn digest_info(digest: &[u8]) -> Vec<u8> {
     out
 }
 
-fn copy_signature(src: &[u8], dst: &mut [u8]) -> Result<usize, i32> {
+fn copy_signature(src: &[u8], dst: &mut [u8]) -> CardResult<usize> {
     if dst.len() < src.len() {
-        return Err(-5);
+        return Err(CardError::BufferTooSmall);
     }
     dst[..src.len()].copy_from_slice(src);
     Ok(src.len())
@@ -1241,7 +1238,7 @@ mod tests {
     #[test]
     fn formats_pin_for_profiles_without_exposing_pin() {
         let mut card = DnieCard::default();
-        card.profile = Profile::V3;
+        card.profile = Some(Profile::V3);
         assert_eq!(
             card.pin_data(b"1234"),
             Some(vec![
@@ -1249,10 +1246,10 @@ mod tests {
             ])
         );
 
-        card.profile = Profile::V1;
+        card.profile = Some(Profile::V1);
         assert_eq!(card.pin_data(b"12345678"), Some(b"12345678".to_vec()));
 
-        card.profile = Profile::V2;
+        card.profile = Some(Profile::V2);
         assert_eq!(card.pin_data(b"1234"), Some(b"1234".to_vec()));
         assert_eq!(card.pin_data(b"123"), None);
         assert_eq!(card.pin_data(b"123456789"), None);
