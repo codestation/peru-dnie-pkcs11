@@ -42,6 +42,7 @@ const SHA256_DIGEST_INFO_PREFIX: &[u8] = &[
     0x00, 0x04, 0x20,
 ];
 const RSA_ENCRYPTION_OID: &str = "1.2.840.113549.1.1.1";
+const EXTENDED_LE: u32 = 65536;
 
 /// DNIe generation detected by ATR or application selection probes.
 #[derive(Clone, Copy, Eq, PartialEq)]
@@ -392,9 +393,10 @@ impl DnieCard {
         }
         let mut cert = Vec::new();
         let mut offset = 0usize;
+        let le = read_binary_le(255, self.secure_messaging.is_some());
         loop {
             let offset_do = [0x54, 0x02, (offset >> 8) as u8, offset as u8];
-            let (plain, sw) = self.transmit(0x00, 0xB1, 0x00, 0x00, &offset_do, Some(255))?;
+            let (plain, sw) = self.transmit(0x00, 0xB1, 0x00, 0x00, &offset_do, Some(le))?;
             if sw == 0x6b00 {
                 break;
             }
@@ -474,6 +476,7 @@ impl DnieCard {
         let mut cert = Vec::new();
         let mut expected_total = None;
         let mut offset = 0usize;
+        let le = read_binary_le(le, self.secure_messaging.is_some());
         loop {
             let (plain, sw) =
                 self.transmit(0x00, 0xB0, (offset >> 8) as u8, offset as u8, &[], Some(le))?;
@@ -1207,6 +1210,10 @@ fn parse_http_url(url: &str) -> anyhow::Result<(String, String, String)> {
     Ok((host.to_owned(), port.to_owned(), format!("/{path}")))
 }
 
+fn read_binary_le(requested: u32, protected: bool) -> u32 {
+    if protected { EXTENDED_LE } else { requested }
+}
+
 fn connect_http(host: &str, port: &str) -> anyhow::Result<TcpStream> {
     let timeout = Duration::from_secs(5);
     let port = port
@@ -1302,6 +1309,12 @@ mod tests {
         );
         assert!(parse_http_url("https://example.test/file.cer").is_err());
         assert!(parse_http_url("http:///file.cer").is_err());
+    }
+
+    #[test]
+    fn uses_extended_le_for_protected_reads() {
+        assert_eq!(read_binary_le(255, false), 255);
+        assert_eq!(read_binary_le(255, true), EXTENDED_LE);
     }
 
     #[test]

@@ -17,14 +17,15 @@ pub fn parse_one(input: &[u8]) -> Option<Tlv<'_>> {
     let mut off = 1;
     let mut tag = input[0] as u32;
     if input[0] & 0x1f == 0x1f {
-        tag = 0;
+        let mut tag_bytes = 1;
         loop {
-            if off >= input.len() {
+            if off >= input.len() || tag_bytes >= 4 {
                 return None;
             }
             let b = input[off];
             off += 1;
             tag = (tag << 8) | b as u32;
+            tag_bytes += 1;
             if b & 0x80 == 0 {
                 break;
             }
@@ -120,6 +121,14 @@ mod tests {
         let input = [0x30, 0x81, 0x03, 1, 2, 3];
         assert_eq!(total_from_prefix(&input[..3]), Some(6));
         assert_eq!(parse_one(&input).unwrap().value, &[1, 2, 3]);
+    }
+
+    #[test]
+    fn parses_multi_byte_tags() {
+        let tlv = parse_one(&[0x7F, 0x49, 0x02, 1, 2]).unwrap();
+        assert_eq!(tlv.tag, 0x7F49);
+        assert_eq!(tlv.value, &[1, 2]);
+        assert_eq!(tlv.total_len, 5);
     }
 
     #[test]

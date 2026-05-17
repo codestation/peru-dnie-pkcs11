@@ -798,6 +798,46 @@ mod tests {
     }
 
     #[test]
+    fn secure_messaging_wrap_encodes_extended_le() {
+        let mut sm = SecureMessaging::new([1; 32], [2; 32]);
+        let apdu = sm.wrap_apdu(0, 0xB0, 0, 0, &[], Some(65536)).unwrap();
+        assert_eq!(&apdu[..4], &[0x0C, 0xB0, 0x00, 0x00]);
+        assert_eq!(apdu[4], 0);
+        assert_eq!(&apdu[apdu.len() - 2..], &[0, 0]);
+        assert!(apdu.windows(4).any(|b| b == [0x97, 0x02, 0x00, 0x00]));
+    }
+
+    #[test]
+    fn secure_messaging_unwraps_long_form_encrypted_response() {
+        let mut sm = SecureMessaging::new([0x11; 32], [0x22; 32]);
+        sm.ssc = 1;
+
+        let plaintext = vec![0xA5; 255];
+        let mut padded = Vec::new();
+        append_iso_pad(&mut padded, &plaintext);
+        let iv = sm.derive_iv(2);
+        let ciphertext = aes256_cbc_encrypt(&sm.k_enc, &iv, &padded).unwrap();
+
+        let mut response = Vec::new();
+        let mut do87 = Vec::with_capacity(ciphertext.len() + 1);
+        do87.push(0x01);
+        do87.extend_from_slice(&ciphertext);
+        append_tlv(&mut response, 0x87, &do87).unwrap();
+        append_tlv(&mut response, 0x99, &[0x90, 0x00]).unwrap();
+
+        let mut mac_input = Vec::new();
+        append_ssc(&mut mac_input, 2);
+        mac_input.extend_from_slice(&response);
+        let mac = aes_cmac_trunc8(&sm.k_mac, &iso_padded(&mac_input)).unwrap();
+        append_tlv(&mut response, 0x8E, &mac).unwrap();
+        response.extend_from_slice(&[0x90, 0x00]);
+
+        let (plain, sw) = sm.unwrap_response(&response).unwrap();
+        assert_eq!(sw, 0x9000);
+        assert_eq!(plain, plaintext);
+    }
+
+    #[test]
     fn parses_supported_card_access_pace_info() {
         let card_access = [
             0x31, 0x14, 0x30, 0x12, 0x06, 0x0A, 0x04, 0x00, 0x7F, 0x00, 0x07, 0x02, 0x02, 0x04,
