@@ -38,11 +38,13 @@ The module has been tested with:
 - `pdfsig`
 - `pyHanko`
 
-## Current Limitation
+## PACE/CAN Secure Messaging
 
-PACE support using the CAN code is not implemented yet. The current signing
-flow works without PACE/CAN; adding it would improve the security posture for
-flows that choose to use CAN-based secure messaging.
+PACE using the CAN code is optional. When no CAN is configured, the current
+signing flow continues to use plaintext card communication. When a CAN is
+configured, the module establishes PACE during card open and protects subsequent
+APDUs with secure messaging. If PACE fails, card open fails instead of falling
+back to plaintext.
 
 ## Requirements
 
@@ -129,6 +131,20 @@ or, when `XDG_CACHE_HOME` is not set:
 Set `PERU_DNIE_AIA_CACHE=0` to ignore the cache. The module will still download
 AIA certificates, but it will not read or write cached files.
 
+## CAN Configuration
+
+To enable PACE secure messaging, provide the CAN with `PERU_DNIE_CAN`:
+
+```sh
+export PERU_DNIE_CAN=123456
+```
+
+Alternatively, set `can = "123456"` in
+`~/.config/peru-dnie-pkcs11/config.toml`. The environment variable takes
+precedence. Do not enable this unless the CAN belongs to the card being used;
+an invalid CAN causes `C_Initialize`/card open paths to fail when the card is
+opened.
+
 ## Logging
 
 Logging is disabled by default. Logs are written to stderr.
@@ -189,9 +205,8 @@ environment, rerun it with direct host access to PC/SC.
 - Certificate listing must not fail only because issuer certificates are
   missing.
 - Signing fails if no issuer certificate can be loaded.
-- PACE/CAN is optional for the current signing flow and is not implemented yet.
-  Adding it would improve security for flows that use CAN-based secure
-  messaging.
+- PACE/CAN is optional for the current signing flow. When configured, it must
+  succeed before the module sends protected card commands.
 
 ## Troubleshooting
 

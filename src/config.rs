@@ -7,6 +7,8 @@ pub struct Config {
     ///
     /// A non-empty value disables AIA discovery and cache use for signing.
     pub cert_chain: Vec<PathBuf>,
+    /// Optional Card Access Number used to establish PACE secure messaging.
+    pub can: Option<String>,
 }
 
 /// Loads module configuration.
@@ -18,14 +20,17 @@ pub fn load() -> Config {
     let env_chain = env::var("PERU_DNIE_CERT_CHAIN")
         .ok()
         .filter(|chain| !chain.is_empty());
+    let env_can = env::var("PERU_DNIE_CAN").ok().filter(|v| !v.is_empty());
 
     let Some(home) = env::var_os("HOME") else {
         cfg.cert_chain = chain_paths(env_chain.as_deref());
+        cfg.can = env_can;
         return cfg;
     };
     let path = PathBuf::from(home).join(".config/peru-dnie-pkcs11/config.toml");
     let Ok(text) = fs::read_to_string(path) else {
         cfg.cert_chain = chain_paths(env_chain.as_deref());
+        cfg.can = env_can;
         return cfg;
     };
     for line in text.lines() {
@@ -36,9 +41,15 @@ pub fn load() -> Config {
         if let Some(v) = quoted_value(line, "cert_chain") {
             cfg.cert_chain = chain_paths(Some(v));
         }
+        if let Some(v) = quoted_value(line, "can").filter(|v| !v.is_empty()) {
+            cfg.can = Some(v.to_owned());
+        }
     }
     if env_chain.is_some() {
         cfg.cert_chain = chain_paths(env_chain.as_deref());
+    }
+    if let Some(can) = env_can {
+        cfg.can = Some(can);
     }
     cfg
 }

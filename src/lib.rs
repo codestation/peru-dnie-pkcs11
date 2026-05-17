@@ -16,6 +16,7 @@ mod config;
 mod ffi;
 mod logging;
 mod objects;
+mod pace;
 mod pkcs11;
 mod tlv;
 

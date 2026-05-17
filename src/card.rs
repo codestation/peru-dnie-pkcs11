@@ -1,9 +1,4 @@
-use crate::{apdu, config, tlv};
-use openssl::{
-    hash::{MessageDigest, hash},
-    pkey::Id,
-    x509::X509,
-};
+use crate::{apdu, config, pace, tlv};
 use pcsc::{Card, Context, Protocols, Scope, ShareMode};
 use sha2::{Digest, Sha256};
 use std::{
@@ -12,6 +7,10 @@ use std::{
     net::{TcpStream, ToSocketAddrs},
     path::{Path, PathBuf},
     time::Duration,
+};
+use x509_cert::{
+    Certificate,
+    der::{Decode, DecodePem, Encode},
 };
 use zeroize::Zeroize;
 
@@ -41,6 +40,7 @@ const SHA256_DIGEST_INFO_PREFIX: &[u8] = &[
     0x30, 0x31, 0x30, 0x0D, 0x06, 0x09, 0x60, 0x86, 0x48, 0x01, 0x65, 0x03, 0x04, 0x02, 0x01, 0x05,
     0x00, 0x04, 0x20,
 ];
+const RSA_ENCRYPTION_OID: &str = "1.2.840.113549.1.1.1";
 
 /// DNIe generation detected by ATR or application selection probes.
 #[derive(Clone, Copy, Eq, PartialEq)]
@@ -78,6 +78,7 @@ pub struct DnieCard {
     pub public_exponent: Vec<u8>,
     pub public_modulus_bits: usize,
     pub token_serial: Option<String>,
+    secure_messaging: Option<pace::SecureMessaging>,
 }
 
 impl Default for DnieCard {
@@ -95,6 +96,7 @@ impl Default for DnieCard {
             public_exponent: Vec::new(),
             public_modulus_bits: 0,
             token_serial: None,
+            secure_messaging: None,
         }
     }
 }
@@ -120,6 +122,17 @@ impl DnieCard {
         card.profile = profile;
         card.atr = atr;
         crate::log_info!("DNIe card connected");
+        if let Some(can) = cfg.can.as_deref() {
+            crate::log_info!("CAN configured; starting PACE");
+            let sm = pace::establish(card.pcsc.as_ref().ok_or(-1)?, can).map_err(|_| {
+                crate::log_warn!("PACE failed; refusing plaintext fallback");
+                -1
+            })?;
+            card.secure_messaging = Some(sm);
+            crate::log_info!("PACE secure messaging established");
+        } else {
+            crate::log_debug!("CAN not configured; using plaintext card communication");
+        }
         Ok(card)
     }
 
@@ -506,16 +519,10 @@ impl DnieCard {
         }
         let der = &cert[..tlv.total_len];
         let obj = parse_cert_object(der).map_err(|_| -1)?;
-        let pkey = X509::from_der(der)
-            .and_then(|c| c.public_key())
-            .map_err(|_| -1)?;
-        if pkey.id() != Id::RSA {
-            return Err(-1);
-        }
-        let rsa = pkey.rsa().map_err(|_| -1)?;
-        self.public_modulus = rsa.n().to_vec();
-        self.public_exponent = rsa.e().to_vec();
-        self.public_modulus_bits = rsa.n().num_bits() as usize;
+        let (modulus, exponent, modulus_bits) = parse_rsa_public_key_from_cert(der)?;
+        self.public_modulus = modulus;
+        self.public_exponent = exponent;
+        self.public_modulus_bits = modulus_bits;
         self.certificate = obj;
         Ok(())
     }
@@ -638,15 +645,11 @@ impl DnieCard {
         if self.chain.len() >= MAX_CHAIN_CERTS {
             return Err(-1);
         }
-        let certs = X509::stack_from_pem(bytes)
-            .map(|stack| stack.into_iter().collect::<Vec<_>>())
-            .or_else(|_| X509::from_der(bytes).map(|c| vec![c]))
-            .map_err(|_| -1)?;
-        for cert in certs {
+        let certs = parse_cert_der_or_pem_many(bytes)?;
+        for der in certs {
             if self.chain.len() >= MAX_CHAIN_CERTS {
                 break;
             }
-            let der = cert.to_der().map_err(|_| -1)?;
             if der == self.certificate.der || self.chain.iter().any(|c| c.der == der) {
                 continue;
             }
@@ -665,31 +668,46 @@ impl DnieCard {
         le: Option<u32>,
     ) -> Result<(Vec<u8>, u16), i32> {
         let card = self.pcsc.as_ref().ok_or(-1)?;
+        let protected = self.secure_messaging.is_some();
         crate::log_debug!(
-            "transmit plain begin: cla={cla:02X}, ins={ins:02X}, p1={p1:02X}, p2={p2:02X}, data_len={}, le={}",
+            "transmit begin: protected={}, cla={cla:02X}, ins={ins:02X}, p1={p1:02X}, p2={p2:02X}, data_len={}, le={}",
+            protected,
             data.len(),
             le.map(|v| v.to_string())
                 .unwrap_or_else(|| "none".to_owned())
         );
-        let apdu = apdu::encode(cla, ins, p1, p2, data, le).map_err(|_| -1)?;
+        let apdu = if let Some(sm) = self.secure_messaging.as_mut() {
+            sm.wrap_apdu(cla, ins, p1, p2, data, le).map_err(|_| -1)?
+        } else {
+            apdu::encode(cla, ins, p1, p2, data, le).map_err(|_| -1)?
+        };
         let mut recv = [0u8; 8192];
         let rsp = match card.transmit(&apdu, &mut recv) {
             Ok(rsp) => rsp,
             Err(_) => {
-                crate::log_warn!("transmit plain PC/SC failed: ins={ins:02X}");
+                crate::log_warn!("transmit PC/SC failed: ins={ins:02X}");
                 return Err(-1);
             }
         };
-        if rsp.len() < 2 {
-            crate::log_warn!("transmit plain failed: response shorter than status word");
-            return Err(-1);
-        }
-        let sw = u16::from_be_bytes([rsp[rsp.len() - 2], rsp[rsp.len() - 1]]);
+        let (plain, sw) = if let Some(sm) = self.secure_messaging.as_mut() {
+            sm.unwrap_response(rsp).map_err(|_| {
+                crate::log_warn!("secure messaging response unwrap failed: ins={ins:02X}");
+                -1
+            })?
+        } else {
+            if rsp.len() < 2 {
+                crate::log_warn!("transmit failed: response shorter than status word");
+                return Err(-1);
+            }
+            let sw = u16::from_be_bytes([rsp[rsp.len() - 2], rsp[rsp.len() - 1]]);
+            (rsp[..rsp.len() - 2].to_vec(), sw)
+        };
         crate::log_debug!(
-            "transmit plain complete: ins={ins:02X}, plain_len={}, sw={sw:04X}",
-            rsp.len() - 2
+            "transmit complete: protected={}, ins={ins:02X}, plain_len={}, sw={sw:04X}",
+            protected,
+            plain.len()
         );
-        Ok((rsp[..rsp.len() - 2].to_vec(), sw))
+        Ok((plain, sw))
     }
 }
 
@@ -840,14 +858,85 @@ fn atr_serial_fallback(atr: &[u8]) -> String {
     }
 }
 
-fn parse_cert_object(der: &[u8]) -> Result<CertObject, openssl::error::ErrorStack> {
-    let cert = X509::from_der(der)?;
+fn parse_cert_object(der: &[u8]) -> Result<CertObject, ()> {
+    let cert = Certificate::from_der(der).map_err(|_| ())?;
+    let tbs = cert.tbs_certificate();
     Ok(CertObject {
         der: der.to_vec(),
-        subject: cert.subject_name().to_der()?,
-        issuer: cert.issuer_name().to_der()?,
-        serial: der_encode_positive_integer(&cert.serial_number().to_bn()?.to_vec()),
+        subject: tbs.subject().to_der().map_err(|_| ())?,
+        issuer: tbs.issuer().to_der().map_err(|_| ())?,
+        serial: der_encode_positive_integer(tbs.serial_number().as_bytes()),
     })
+}
+
+fn parse_rsa_public_key_from_cert(der: &[u8]) -> Result<(Vec<u8>, Vec<u8>, usize), i32> {
+    let cert = Certificate::from_der(der).map_err(|_| -1)?;
+    let spki = cert.tbs_certificate().subject_public_key_info();
+    if spki.algorithm.oid.to_string() != RSA_ENCRYPTION_OID {
+        return Err(-1);
+    }
+    let key_der = spki.subject_public_key.as_bytes().ok_or(-1)?;
+    let seq = tlv::parse_one(key_der).ok_or(-1)?;
+    if seq.tag != 0x30 || seq.total_len != key_der.len() {
+        return Err(-1);
+    }
+    let modulus_tlv = tlv::parse_one(seq.value).ok_or(-1)?;
+    if modulus_tlv.tag != 0x02 {
+        return Err(-1);
+    }
+    let exponent_tlv = tlv::parse_one(&seq.value[modulus_tlv.total_len..]).ok_or(-1)?;
+    if exponent_tlv.tag != 0x02 || modulus_tlv.total_len + exponent_tlv.total_len != seq.value.len()
+    {
+        return Err(-1);
+    }
+    let modulus = der_positive_integer_magnitude(modulus_tlv.value);
+    let exponent = der_positive_integer_magnitude(exponent_tlv.value);
+    if modulus.is_empty() || exponent.is_empty() {
+        return Err(-1);
+    }
+    let modulus_bits = integer_bit_len(&modulus);
+    Ok((modulus, exponent, modulus_bits))
+}
+
+fn der_positive_integer_magnitude(value: &[u8]) -> Vec<u8> {
+    let mut value = value;
+    while value.len() > 1 && value[0] == 0 {
+        value = &value[1..];
+    }
+    value.to_vec()
+}
+
+fn integer_bit_len(value: &[u8]) -> usize {
+    let Some(first) = value.first() else {
+        return 0;
+    };
+    let leading = first.leading_zeros() as usize;
+    (value.len() - 1) * 8 + (8 - leading)
+}
+
+fn parse_cert_der_or_pem_many(bytes: &[u8]) -> Result<Vec<Vec<u8>>, i32> {
+    if let Ok(cert) = Certificate::from_der(bytes) {
+        return cert.to_der().map(|der| vec![der]).map_err(|_| -1);
+    }
+
+    let text = std::str::from_utf8(bytes).map_err(|_| -1)?;
+    let mut out = Vec::new();
+    let mut rest = text;
+    const BEGIN: &str = "-----BEGIN CERTIFICATE-----";
+    const END: &str = "-----END CERTIFICATE-----";
+    while let Some(begin) = rest.find(BEGIN) {
+        let after_begin = &rest[begin..];
+        let end = after_begin.find(END).ok_or(-1)?;
+        let block_end = end + END.len();
+        let block = &after_begin[..block_end];
+        let cert = Certificate::from_pem(block.as_bytes()).map_err(|_| -1)?;
+        out.push(cert.to_der().map_err(|_| -1)?);
+        rest = &after_begin[block_end..];
+    }
+    if out.is_empty() {
+        return Err(-1);
+    }
+    Ok(out)
 }
 
 fn der_encode_positive_integer(value: &[u8]) -> Vec<u8> {
@@ -875,7 +964,7 @@ fn digest_for_sign(mechanism: u64, data: &[u8]) -> Option<Vec<u8>> {
     const CKM_RSA_PKCS: u64 = 0x00000001;
     const CKM_SHA256_RSA_PKCS: u64 = 0x00000040;
     if mechanism == CKM_SHA256_RSA_PKCS {
-        return hash(MessageDigest::sha256(), data).ok().map(|d| d.to_vec());
+        return Some(Sha256::digest(data).to_vec());
     }
     if mechanism == CKM_RSA_PKCS && data.len() == 32 {
         return Some(data.to_vec());
@@ -887,7 +976,7 @@ fn digest_for_sign(mechanism: u64, data: &[u8]) -> Option<Vec<u8>> {
         return Some(data[SHA256_DIGEST_INFO_PREFIX.len()..].to_vec());
     }
     if mechanism == CKM_RSA_PKCS && !data.is_empty() {
-        return hash(MessageDigest::sha256(), data).ok().map(|d| d.to_vec());
+        return Some(Sha256::digest(data).to_vec());
     }
     None
 }
