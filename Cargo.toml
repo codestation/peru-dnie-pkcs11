@@ -16,6 +16,7 @@ crate-type = ["cdylib"]
 
 [dependencies]
 aes = "0.9.0"
+anyhow = "1"
 bp256 = { version = "0.14.0-rc.8", features = ["arithmetic"] }
 cmac = "0.8.0"
 cryptoki-sys = "0.5.0"

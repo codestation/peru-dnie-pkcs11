@@ -1,4 +1,5 @@
 use crate::{apdu, config, pace, tlv};
+use anyhow::{Context as AnyhowContext, anyhow, bail};
 use pcsc::{Card, Context, Protocols, Scope, ShareMode};
 use sha2::{Digest, Sha256};
 use std::{
@@ -512,14 +513,23 @@ impl DnieCard {
 
     fn store_sign_certificate(&mut self, cert: &[u8]) -> Result<(), i32> {
         let Some(tlv) = tlv::parse_one(cert) else {
+            crate::log_warn!("signing certificate is not valid BER-TLV");
             return Err(-1);
         };
         if tlv.tag != 0x30 || tlv.value.is_empty() {
+            crate::log_warn!("signing certificate TLV is not an X.509 sequence");
             return Err(-1);
         }
         let der = &cert[..tlv.total_len];
-        let obj = parse_cert_object(der).map_err(|_| -1)?;
-        let (modulus, exponent, modulus_bits) = parse_rsa_public_key_from_cert(der)?;
+        let obj = parse_cert_object(der).map_err(|err| {
+            crate::log_warn!("parse signing certificate object failed: {err:#}");
+            -1
+        })?;
+        let (modulus, exponent, modulus_bits) =
+            parse_rsa_public_key_from_cert(der).map_err(|err| {
+                crate::log_warn!("parse signing certificate RSA public key failed: {err:#}");
+                -1
+            })?;
         self.public_modulus = modulus;
         self.public_exponent = exponent;
         self.public_modulus_bits = modulus_bits;
@@ -574,10 +584,12 @@ impl DnieCard {
                     path.display(),
                     self.chain.len()
                 ),
-                Err(_) => crate::log_warn!(
-                    "configured chain certificate could not be loaded: path={}",
-                    path.display()
-                ),
+                Err(err) => {
+                    crate::log_warn!(
+                        "configured chain certificate could not be loaded: path={}, error={err:#}",
+                        path.display()
+                    );
+                }
             }
             if self.chain.len() >= MAX_CHAIN_CERTS {
                 break;
@@ -586,8 +598,19 @@ impl DnieCard {
     }
 
     fn load_chain_cert(&mut self, path: &Path) -> Result<(), i32> {
-        let bytes = fs::read(path).map_err(|_| -1)?;
-        self.load_chain_cert_bytes(&bytes)
+        let bytes = fs::read(path)
+            .with_context(|| format!("read certificate chain file {}", path.display()))
+            .map_err(|err| {
+                crate::log_warn!("{err:#}");
+                -1
+            })?;
+        self.load_chain_cert_bytes(&bytes).map_err(|err| {
+            crate::log_warn!(
+                "parse certificate chain file {} failed: {err:#}",
+                path.display()
+            );
+            -1
+        })
     }
 
     fn load_aia_chain_certs(&mut self) {
@@ -614,24 +637,47 @@ impl DnieCard {
         if aia_cache_enabled() {
             let cache_path = aia_cache_path(url).ok_or(-1)?;
             crate::log_debug!("AIA cache path: {}", cache_path.display());
-            let before = self.chain.len();
-            if self.load_chain_cert(&cache_path).is_ok() && self.chain.len() > before {
-                crate::log_info!("AIA issuer certificate loaded from cache");
-                return Ok(());
+            if cache_path.exists() {
+                let before = self.chain.len();
+                if self.load_chain_cert(&cache_path).is_ok() && self.chain.len() > before {
+                    crate::log_info!("AIA issuer certificate loaded from cache");
+                    return Ok(());
+                }
+                if let Err(err) = fs::remove_file(&cache_path) {
+                    crate::log_warn!(
+                        "invalid AIA cache file could not be removed: path={}, error={err}",
+                        cache_path.display()
+                    );
+                } else {
+                    crate::log_warn!(
+                        "invalid AIA cache file removed: path={}",
+                        cache_path.display()
+                    );
+                }
             }
             crate::log_info!("AIA cache miss; downloading issuer certificate");
-            http_get_to_file(url, &cache_path)?;
+            let bytes = http_get(url).map_err(|err| {
+                crate::log_warn!("AIA issuer download failed: {err:#}");
+                -1
+            })?;
             let before = self.chain.len();
-            if self.load_chain_cert(&cache_path).is_ok() && self.chain.len() > before {
-                crate::log_info!("AIA issuer certificate downloaded and cached");
+            if self.load_chain_cert_bytes(&bytes).is_ok() && self.chain.len() > before {
+                if let Err(err) = fs::write(&cache_path, &bytes).with_context(|| {
+                    format!("write downloaded certificate to {}", cache_path.display())
+                }) {
+                    crate::log_warn!("AIA issuer cache write failed: {err:#}");
+                }
+                crate::log_info!("AIA issuer certificate loaded from download");
                 return Ok(());
             }
-            let _ = fs::remove_file(cache_path);
             crate::log_warn!("downloaded AIA issuer certificate was not usable");
             return Err(-1);
         }
         crate::log_info!("AIA cache disabled; downloading issuer certificate without caching");
-        let bytes = http_get(url)?;
+        let bytes = http_get(url).map_err(|err| {
+            crate::log_warn!("AIA issuer download failed: {err:#}");
+            -1
+        })?;
         let before = self.chain.len();
         if self.load_chain_cert_bytes(&bytes).is_ok() && self.chain.len() > before {
             crate::log_info!("AIA issuer certificate loaded from download");
@@ -641,11 +687,11 @@ impl DnieCard {
         Err(-1)
     }
 
-    fn load_chain_cert_bytes(&mut self, bytes: &[u8]) -> Result<(), i32> {
+    fn load_chain_cert_bytes(&mut self, bytes: &[u8]) -> anyhow::Result<()> {
         if self.chain.len() >= MAX_CHAIN_CERTS {
-            return Err(-1);
+            bail!("certificate chain object limit reached");
         }
-        let certs = parse_cert_der_or_pem_many(bytes)?;
+        let certs = parse_cert_der_or_pem_many(bytes).context("parse chain certificate data")?;
         for der in certs {
             if self.chain.len() >= MAX_CHAIN_CERTS {
                 break;
@@ -653,7 +699,8 @@ impl DnieCard {
             if der == self.certificate.der || self.chain.iter().any(|c| c.der == der) {
                 continue;
             }
-            self.chain.push(parse_cert_object(&der).map_err(|_| -1)?);
+            self.chain
+                .push(parse_cert_object(&der).context("parse chain certificate object")?);
         }
         Ok(())
     }
@@ -858,41 +905,49 @@ fn atr_serial_fallback(atr: &[u8]) -> String {
     }
 }
 
-fn parse_cert_object(der: &[u8]) -> Result<CertObject, ()> {
-    let cert = Certificate::from_der(der).map_err(|_| ())?;
+fn parse_cert_object(der: &[u8]) -> anyhow::Result<CertObject> {
+    let cert = Certificate::from_der(der).context("decode X.509 certificate DER")?;
     let tbs = cert.tbs_certificate();
     Ok(CertObject {
         der: der.to_vec(),
-        subject: tbs.subject().to_der().map_err(|_| ())?,
-        issuer: tbs.issuer().to_der().map_err(|_| ())?,
+        subject: tbs
+            .subject()
+            .to_der()
+            .context("encode certificate subject")?,
+        issuer: tbs.issuer().to_der().context("encode certificate issuer")?,
         serial: der_encode_positive_integer(tbs.serial_number().as_bytes()),
     })
 }
 
-fn parse_rsa_public_key_from_cert(der: &[u8]) -> Result<(Vec<u8>, Vec<u8>, usize), i32> {
-    let cert = Certificate::from_der(der).map_err(|_| -1)?;
+fn parse_rsa_public_key_from_cert(der: &[u8]) -> anyhow::Result<(Vec<u8>, Vec<u8>, usize)> {
+    let cert = Certificate::from_der(der).context("decode X.509 certificate DER")?;
     let spki = cert.tbs_certificate().subject_public_key_info();
     if spki.algorithm.oid.to_string() != RSA_ENCRYPTION_OID {
-        return Err(-1);
+        bail!("certificate public key algorithm is not RSA");
     }
-    let key_der = spki.subject_public_key.as_bytes().ok_or(-1)?;
-    let seq = tlv::parse_one(key_der).ok_or(-1)?;
+    let key_der = spki
+        .subject_public_key
+        .as_bytes()
+        .ok_or_else(|| anyhow!("RSA subjectPublicKey is not byte-aligned"))?;
+    let seq = tlv::parse_one(key_der).ok_or_else(|| anyhow!("parse RSA public key sequence"))?;
     if seq.tag != 0x30 || seq.total_len != key_der.len() {
-        return Err(-1);
+        bail!("RSA public key is not a complete DER sequence");
     }
-    let modulus_tlv = tlv::parse_one(seq.value).ok_or(-1)?;
+    let modulus_tlv =
+        tlv::parse_one(seq.value).ok_or_else(|| anyhow!("parse RSA modulus integer"))?;
     if modulus_tlv.tag != 0x02 {
-        return Err(-1);
+        bail!("RSA modulus is not a DER integer");
     }
-    let exponent_tlv = tlv::parse_one(&seq.value[modulus_tlv.total_len..]).ok_or(-1)?;
+    let exponent_tlv = tlv::parse_one(&seq.value[modulus_tlv.total_len..])
+        .ok_or_else(|| anyhow!("parse RSA public exponent integer"))?;
     if exponent_tlv.tag != 0x02 || modulus_tlv.total_len + exponent_tlv.total_len != seq.value.len()
     {
-        return Err(-1);
+        bail!("RSA public key sequence has invalid exponent or trailing data");
     }
     let modulus = der_positive_integer_magnitude(modulus_tlv.value);
     let exponent = der_positive_integer_magnitude(exponent_tlv.value);
     if modulus.is_empty() || exponent.is_empty() {
-        return Err(-1);
+        bail!("RSA modulus or public exponent is empty");
     }
     let modulus_bits = integer_bit_len(&modulus);
     Ok((modulus, exponent, modulus_bits))
@@ -914,30 +969,44 @@ fn integer_bit_len(value: &[u8]) -> usize {
     (value.len() - 1) * 8 + (8 - leading)
 }
 
-fn parse_cert_der_or_pem_many(bytes: &[u8]) -> Result<Vec<Vec<u8>>, i32> {
-    if let Ok(cert) = Certificate::from_der(bytes) {
-        return cert.to_der().map(|der| vec![der]).map_err(|_| -1);
+fn parse_cert_der_or_pem_many(bytes: &[u8]) -> anyhow::Result<Vec<Vec<u8>>> {
+    let der_error = match Certificate::from_der(bytes) {
+        Ok(cert) => {
+            return cert
+                .to_der()
+                .map(|der| vec![der])
+                .context("re-encode DER certificate");
+        }
+        Err(err) => err,
+    };
+
+    if !bytes.windows(BEGIN_CERT.len()).any(|w| w == BEGIN_CERT) {
+        return Err(anyhow!("decode DER certificate: {der_error}"));
     }
 
-    let text = std::str::from_utf8(bytes).map_err(|_| -1)?;
+    // RENIEC publishes some certificate files with non-UTF-8 descriptive
+    // preamble text. Treat PEM armor as byte-delimited ASCII and ignore the
+    // surrounding text encoding.
     let mut out = Vec::new();
-    let mut rest = text;
-    const BEGIN: &str = "-----BEGIN CERTIFICATE-----";
-    const END: &str = "-----END CERTIFICATE-----";
-    while let Some(begin) = rest.find(BEGIN) {
+    let mut rest = bytes;
+    while let Some(begin) = find_bytes(rest, BEGIN_CERT) {
         let after_begin = &rest[begin..];
-        let end = after_begin.find(END).ok_or(-1)?;
-        let block_end = end + END.len();
+        let end = find_bytes(after_begin, END_CERT)
+            .ok_or_else(|| anyhow!("PEM certificate block is missing END marker"))?;
+        let block_end = end + END_CERT.len();
         let block = &after_begin[..block_end];
-        let cert = Certificate::from_pem(block.as_bytes()).map_err(|_| -1)?;
-        out.push(cert.to_der().map_err(|_| -1)?);
+        let cert = Certificate::from_pem(block).context("decode PEM certificate")?;
+        out.push(cert.to_der().context("convert PEM certificate to DER")?);
         rest = &after_begin[block_end..];
     }
     if out.is_empty() {
-        return Err(-1);
+        bail!("no PEM certificate blocks found");
     }
     Ok(out)
 }
+
+const BEGIN_CERT: &[u8] = b"-----BEGIN CERTIFICATE-----";
+const END_CERT: &[u8] = b"-----END CERTIFICATE-----";
 
 fn der_encode_positive_integer(value: &[u8]) -> Vec<u8> {
     let mut content = if value.is_empty() {
@@ -1007,8 +1076,7 @@ fn aia_http_urls(cert_der: &[u8]) -> Vec<String> {
         };
         let end = start + len;
         if end > start {
-            let mut url = String::from_utf8_lossy(&cert_der[start..end]).into_owned();
-            rewrite_reniec_aia_url(&mut url);
+            let url = String::from_utf8_lossy(&cert_der[start..end]).into_owned();
             if !urls.iter().any(|u| u == &url) {
                 urls.push(url);
             }
@@ -1038,14 +1106,6 @@ fn asn1_uri_len(input: &[u8], value_start: usize) -> Option<usize> {
     (len > 0 && value_start + len <= input.len()).then_some(len)
 }
 
-fn rewrite_reniec_aia_url(url: &mut String) {
-    let old = "www.reniec.gob.pe/crt/sha2";
-    let new = "crl.reniec.gob.pe/crt/sha2";
-    if url.contains(old) {
-        *url = url.replace(old, new);
-    }
-}
-
 fn aia_cache_path(url: &str) -> Option<PathBuf> {
     let base = env::var_os("XDG_CACHE_HOME")
         .map(PathBuf::from)
@@ -1066,17 +1126,28 @@ fn aia_cache_enabled() -> bool {
     !env::var("PERU_DNIE_AIA_CACHE").is_ok_and(|v| v == "0")
 }
 
-fn http_get_to_file(url: &str, path_out: &Path) -> Result<(), i32> {
-    let body = http_get(url)?;
-    fs::write(path_out, body).map_err(|_| -1)
+fn http_get(url: &str) -> anyhow::Result<Vec<u8>> {
+    let response = http_get_response(url).with_context(|| format!("download {url}"))?;
+    if !response.status_ok {
+        bail!("HTTP response status is not 200");
+    }
+    Ok(response.body)
 }
 
-fn http_get(url: &str) -> Result<Vec<u8>, i32> {
-    let (host, port, path) = parse_http_url(url)?;
+struct HttpResponse {
+    status_ok: bool,
+    body: Vec<u8>,
+}
+
+fn http_get_response(url: &str) -> anyhow::Result<HttpResponse> {
+    let (host, port, path) = parse_http_url(url).with_context(|| format!("parse URL {url}"))?;
     crate::log_debug!("connecting for HTTP download: host={host}, port={port}");
-    let mut stream = connect_http(&host, &port)?;
+    let mut stream =
+        connect_http(&host, &port).with_context(|| format!("connect to {host}:{port}"))?;
     let req = format!("GET {path} HTTP/1.0\r\nHost: {host}\r\nConnection: close\r\n\r\n");
-    stream.write_all(req.as_bytes()).map_err(|_| -1)?;
+    stream
+        .write_all(req.as_bytes())
+        .with_context(|| format!("send HTTP request for {path}"))?;
     crate::log_debug!("HTTP request sent: host={host}, path={path}");
     let mut rsp = Vec::new();
     let deadline = std::time::Instant::now() + Duration::from_secs(10);
@@ -1084,14 +1155,14 @@ fn http_get(url: &str) -> Result<Vec<u8>, i32> {
     loop {
         if std::time::Instant::now() >= deadline {
             crate::log_warn!("HTTP download timed out: url={url}");
-            return Err(-1);
+            bail!("HTTP download timed out");
         }
         match stream.read(&mut buf) {
             Ok(0) => break,
             Ok(n) => {
                 rsp.extend_from_slice(&buf[..n]);
                 if rsp.len() > 256 * 1024 {
-                    return Err(-1);
+                    bail!("HTTP response exceeded 256 KiB limit");
                 }
             }
             Err(e)
@@ -1099,47 +1170,56 @@ fn http_get(url: &str) -> Result<Vec<u8>, i32> {
                     || e.kind() == std::io::ErrorKind::TimedOut =>
             {
                 crate::log_warn!("HTTP read timed out: url={url}");
-                return Err(-1);
+                bail!("HTTP read timed out");
             }
-            Err(_) => return Err(-1),
+            Err(err) => return Err(err).context("read HTTP response"),
         }
     }
     crate::log_debug!("HTTP response received: bytes={}", rsp.len());
     if !rsp.starts_with(b"HTTP/") {
-        return Err(-1);
+        bail!("HTTP response does not start with status line");
     }
     let status_ok = rsp
         .iter()
         .take(64)
         .position(|b| *b == b' ')
         .is_some_and(|i| rsp.get(i + 1..i + 5) == Some(b"200 "));
-    if !status_ok {
-        return Err(-1);
-    }
     let Some(body_start) = rsp.windows(4).position(|w| w == b"\r\n\r\n").map(|i| i + 4) else {
-        return Err(-1);
+        bail!("HTTP response has no header/body separator");
     };
-    Ok(rsp[body_start..].to_vec())
+    Ok(HttpResponse {
+        status_ok,
+        body: rsp[body_start..].to_vec(),
+    })
 }
 
-fn parse_http_url(url: &str) -> Result<(String, String, String), i32> {
-    let rest = url.strip_prefix("http://").ok_or(-1)?;
-    let (host_port, path) = rest.split_once('/').ok_or(-1)?;
+fn parse_http_url(url: &str) -> anyhow::Result<(String, String, String)> {
+    let rest = url
+        .strip_prefix("http://")
+        .ok_or_else(|| anyhow!("only http:// AIA URLs are supported"))?;
+    let (host_port, path) = rest
+        .split_once('/')
+        .ok_or_else(|| anyhow!("URL is missing a path"))?;
     if host_port.is_empty() {
-        return Err(-1);
+        bail!("URL host is empty");
     }
     let (host, port) = host_port.split_once(':').unwrap_or((host_port, "80"));
     if host.is_empty() || port.is_empty() {
-        return Err(-1);
+        bail!("URL host or port is empty");
     }
     Ok((host.to_owned(), port.to_owned(), format!("/{path}")))
 }
 
-fn connect_http(host: &str, port: &str) -> Result<TcpStream, i32> {
+fn connect_http(host: &str, port: &str) -> anyhow::Result<TcpStream> {
     let timeout = Duration::from_secs(5);
-    let port = port.parse::<u16>().map_err(|_| -1)?;
+    let port = port
+        .parse::<u16>()
+        .with_context(|| format!("parse TCP port {port}"))?;
     crate::log_debug!("resolving host: {host}");
-    for addr in (host, port).to_socket_addrs().map_err(|_| -1)? {
+    for addr in (host, port)
+        .to_socket_addrs()
+        .with_context(|| format!("resolve host {host}"))?
+    {
         crate::log_debug!("connecting to address: {addr}");
         let Ok(stream) = TcpStream::connect_timeout(&addr, timeout) else {
             continue;
@@ -1148,7 +1228,7 @@ fn connect_http(host: &str, port: &str) -> Result<TcpStream, i32> {
         let _ = stream.set_write_timeout(Some(timeout));
         return Ok(stream);
     }
-    Err(-1)
+    bail!("no resolved address accepted a TCP connection")
 }
 
 #[cfg(test)]
@@ -1195,33 +1275,33 @@ mod tests {
     }
 
     #[test]
-    fn parses_and_rewrites_aia_http_urls() {
+    fn parses_aia_http_urls_without_rewriting() {
         let url = b"http://www.reniec.gob.pe/crt/sha2/a.cer";
         let mut der_fragment = vec![0x86, url.len() as u8];
         der_fragment.extend_from_slice(url);
         assert_eq!(
             aia_http_urls(&der_fragment),
-            vec!["http://crl.reniec.gob.pe/crt/sha2/a.cer"]
+            vec!["http://www.reniec.gob.pe/crt/sha2/a.cer"]
         );
     }
 
     #[test]
     fn parses_plain_http_urls() {
         assert_eq!(
-            parse_http_url("http://example.test:8080/path/file.cer"),
-            Ok((
+            parse_http_url("http://example.test:8080/path/file.cer").unwrap(),
+            (
                 "example.test".to_owned(),
                 "8080".to_owned(),
                 "/path/file.cer".to_owned()
-            ))
+            )
         );
         assert_eq!(
-            parse_http_url("http://example.test/file.cer"),
-            Ok((
+            parse_http_url("http://example.test/file.cer").unwrap(),
+            (
                 "example.test".to_owned(),
                 "80".to_owned(),
                 "/file.cer".to_owned()
-            ))
+            )
         );
         assert!(parse_http_url("https://example.test/file.cer").is_err());
         assert!(parse_http_url("http:///file.cer").is_err());

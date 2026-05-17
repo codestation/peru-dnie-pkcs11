@@ -490,6 +490,7 @@ name = "peru-dnie-pkcs11"
 version = "0.1.0"
 dependencies = [
  "aes",
+ "anyhow",
  "bp256",
  "cmac",
  "cryptoki-sys",
