@@ -592,10 +592,10 @@ fn random_scalar() -> Result<Scalar, ()> {
     loop {
         let bytes = random_32()?;
         let repr = FieldBytes::from(bytes);
-        if let Some(scalar) = Scalar::from_repr(repr).into_option() {
-            if !bool::from(scalar.is_zero()) {
-                return Ok(scalar);
-            }
+        if let Some(scalar) = Scalar::from_repr(repr).into_option()
+            && !bool::from(scalar.is_zero())
+        {
+            return Ok(scalar);
         }
     }
 }
@@ -614,15 +614,14 @@ fn aes256_ecb_encrypt_block(key: &[u8; 32], block: [u8; 16]) -> [u8; 16] {
 }
 
 fn aes256_cbc_encrypt(key: &[u8; 32], iv: &[u8; 16], input: &[u8]) -> Result<Vec<u8>, ()> {
-    if input.len() % 16 != 0 {
+    if !input.len().is_multiple_of(16) {
         return Err(());
     }
     let cipher = Aes256::new(&Array::from(*key));
     let mut prev = *iv;
     let mut out = Vec::with_capacity(input.len());
-    for chunk in input.chunks_exact(16) {
-        let mut block = [0u8; 16];
-        block.copy_from_slice(chunk);
+    for chunk in input.as_chunks::<16>().0 {
+        let mut block = *chunk;
         for i in 0..16 {
             block[i] ^= prev[i];
         }
@@ -635,15 +634,14 @@ fn aes256_cbc_encrypt(key: &[u8; 32], iv: &[u8; 16], input: &[u8]) -> Result<Vec
 }
 
 fn aes256_cbc_decrypt(key: &[u8; 32], iv: &[u8; 16], input: &[u8]) -> Result<Vec<u8>, ()> {
-    if input.is_empty() || input.len() % 16 != 0 {
+    if input.is_empty() || !input.len().is_multiple_of(16) {
         return Err(());
     }
     let cipher = Aes256::new(&Array::from(*key));
     let mut prev = *iv;
     let mut out = Vec::with_capacity(input.len());
-    for chunk in input.chunks_exact(16) {
-        let mut block = [0u8; 16];
-        block.copy_from_slice(chunk);
+    for chunk in input.as_chunks::<16>().0 {
+        let block = *chunk;
         let encrypted = block;
         let mut block = Array::from(block);
         cipher.decrypt_block(&mut block);
@@ -691,7 +689,7 @@ fn append_ssc(out: &mut Vec<u8>, ssc: u64) {
 fn append_iso_pad(out: &mut Vec<u8>, data: &[u8]) {
     out.extend_from_slice(data);
     out.push(0x80);
-    while out.len() % 16 != 0 {
+    while !out.len().is_multiple_of(16) {
         out.push(0);
     }
 }

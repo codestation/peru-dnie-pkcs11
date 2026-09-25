@@ -48,7 +48,7 @@ back to plaintext.
 
 ## Requirements
 
-- Rust 1.85 or newer
+- Rust 1.98 or newer
 - PC/SC runtime and development headers
 - OpenSSL development headers
 - A Peruvian DNIe card and compatible reader
