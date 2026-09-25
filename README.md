@@ -193,6 +193,30 @@ pkcs11-tool --module ./target/release/libperu_dnie_pkcs11.so -L
 pkcs11-tool --module ./target/release/libperu_dnie_pkcs11.so -O
 ```
 
+The opt-in hardware regression tests exercise card detection, signing
+certificate enumeration, signing, and independent RSA signature verification
+in both communication modes when the card supports CAN/PACE. DNIe 1.0 and 2.0
+run only the no-CAN case; the CAN case detects the generation and exits without
+requesting a CAN. The tests require a valid PIN, and DNIe 3.0 needs a CAN for
+the PACE case. Make an issuer certificate available through
+`PERU_DNIE_CERT_CHAIN` or AIA before running them. Run serially because both
+cases use the same physical card:
+
+```sh
+read -rs -p 'DNIe PIN: ' PERU_DNIE_TEST_PIN; echo
+export PERU_DNIE_TEST_PIN
+# Omit the next two lines for DNIe 1.0/2.0:
+read -rs -p 'DNIe CAN: ' PERU_DNIE_TEST_CAN; echo
+export PERU_DNIE_TEST_CAN
+cargo test --all-features hardware_ -- --ignored --test-threads=1
+unset PERU_DNIE_TEST_PIN PERU_DNIE_TEST_CAN
+```
+
+Each case requests a PC/SC `ResetCard` when its connection closes, including
+when a test assertion fails. A failed PACE setup also requests a reset. The
+reader or card may still need physical reinsertion if PC/SC itself stops
+responding. PIN retries are card-limited, so use only known valid credentials.
+
 If a PC/SC command reports `SCardEstablishContext failed` in a sandboxed
 environment, rerun it with direct host access to PC/SC.
 

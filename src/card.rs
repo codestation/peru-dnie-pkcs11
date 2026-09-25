@@ -1,6 +1,6 @@
 use crate::{apdu, config, pace, tlv};
 use anyhow::{Context as AnyhowContext, anyhow, bail};
-use pcsc::{Card, Context, Protocols, Scope, ShareMode};
+use pcsc::{Card, Context, Disposition, Protocols, Scope, ShareMode};
 use sha2::{Digest, Sha256};
 use std::{
     env, fmt, fs,
@@ -119,6 +119,11 @@ impl Drop for DnieCard {
 impl DnieCard {
     pub fn open() -> CardResult<Self> {
         let cfg = config::load();
+        Self::open_with_can(cfg.can.as_deref())
+    }
+
+    fn open_with_can(can: Option<&str>) -> CardResult<Self> {
+        let cfg = config::load();
         crate::log_info!(
             "opening DNIe card: configured_chain_paths={}",
             cfg.cert_chain.len()
@@ -131,11 +136,14 @@ impl DnieCard {
         card.profile = Some(profile);
         card.atr = atr;
         crate::log_info!("DNIe card connected");
-        if let Some(can) = cfg.can.as_deref() {
+        if let Some(can) = can {
             crate::log_info!("CAN configured; starting PACE");
             let sm =
                 pace::establish(card.pcsc.as_ref().ok_or(CardError::Card)?, can).map_err(|_| {
                     crate::log_warn!("PACE failed; refusing plaintext fallback");
+                    if let Some(pcsc) = card.pcsc.take() {
+                        let _ = pcsc.disconnect(Disposition::ResetCard);
+                    }
                     CardError::Card
                 })?;
             card.secure_messaging = Some(sm);
@@ -1265,9 +1273,91 @@ fn connect_http(host: &str, port: &str) -> anyhow::Result<TcpStream> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use num_bigint::BigUint;
 
     const CKM_RSA_PKCS: u64 = 0x00000001;
     const CKM_SHA256_RSA_PKCS: u64 = 0x00000040;
+
+    struct HardwareCard(DnieCard);
+
+    impl Drop for HardwareCard {
+        fn drop(&mut self) {
+            self.0.logout();
+            if let Some(card) = self.0.pcsc.take()
+                && let Err((_, error)) = card.disconnect(Disposition::ResetCard)
+            {
+                eprintln!("PC/SC card reset failed: {error}");
+            }
+        }
+    }
+
+    fn hardware_workflow(can: Option<&str>) {
+        let pin = env::var("PERU_DNIE_TEST_PIN").expect("set PERU_DNIE_TEST_PIN");
+        let mut card = HardwareCard(DnieCard::open_with_can(can).expect("DNIe detection failed"));
+        assert!(card.0.present);
+        assert!(card.0.profile.is_some());
+        card.0
+            .ensure_signing_certificate()
+            .expect("signing certificate enumeration failed");
+        assert!(!card.0.certificate.der.is_empty());
+        // Issuer certificates may be unavailable during listing, but signing requires one.
+        card.0.load_chain_certs_nonfatal(config::load().cert_chain);
+        card.0.login(pin.as_bytes()).expect("DNIe PIN login failed");
+
+        let data = b"peru-dnie-pkcs11 hardware signing regression";
+        let len = card
+            .0
+            .sign(CKM_SHA256_RSA_PKCS, data, None)
+            .expect("signature size failed");
+        let mut signature = vec![0; len];
+        let written = card
+            .0
+            .sign(CKM_SHA256_RSA_PKCS, data, Some(&mut signature))
+            .expect("card signing failed");
+        signature.truncate(written);
+        let modulus = BigUint::from_bytes_be(&card.0.public_modulus);
+        let exponent = BigUint::from_bytes_be(&card.0.public_exponent);
+        let recovered = BigUint::from_bytes_be(&signature).modpow(&exponent, &modulus);
+        let encoded = recovered.to_bytes_be();
+        let padding_len = card.0.public_modulus.len() - encoded.len();
+        let mut block = vec![0; padding_len];
+        block.extend_from_slice(&encoded);
+        let digest = Sha256::digest(data);
+        let expected_tail = digest_info(&digest);
+        assert!(block.len() >= expected_tail.len() + 11);
+        assert_eq!(&block[..2], &[0, 1]);
+        let separator = block[2..]
+            .iter()
+            .position(|&byte| byte == 0)
+            .map(|index| index + 2)
+            .expect("PKCS#1 separator missing");
+        assert!(separator >= 10);
+        assert!(block[2..separator].iter().all(|&byte| byte == 0xff));
+        assert_eq!(&block[separator + 1..], expected_tail);
+    }
+
+    #[test]
+    #[ignore = "requires a DNIe, reader, PIN, and issuer certificate"]
+    fn hardware_without_can() {
+        hardware_workflow(None);
+    }
+
+    #[test]
+    #[ignore = "requires a DNIe, reader, PIN, CAN, and issuer certificate"]
+    fn hardware_with_can() {
+        let (probe, profile, _) = find_peru_dnie().expect("DNIe detection failed");
+        probe
+            .disconnect(Disposition::ResetCard)
+            .unwrap_or_else(|(_, error)| {
+                panic!("PC/SC card reset after detection failed: {error}")
+            });
+        if profile != Profile::V3 {
+            eprintln!("CAN/PACE hardware case skipped: this DNIe generation has no CAN");
+            return;
+        }
+        let can = env::var("PERU_DNIE_TEST_CAN").expect("set PERU_DNIE_TEST_CAN");
+        hardware_workflow(Some(&can));
+    }
 
     #[test]
     fn formats_pin_for_profiles_without_exposing_pin() {
