@@ -78,7 +78,10 @@ pub extern "C" fn C_GetTokenInfo(slot_id: CK_SLOT_ID, info: CK_TOKEN_INFO_PTR) -
     fill_blank(&mut info.label, format!("Peru DNIe {version}").as_bytes());
     fill_blank(&mut info.manufacturerID, b"IDEMIA");
     fill_blank(&mut info.model, format!("DNIe {version}").as_bytes());
-    let serial = card.ensure_token_serial().unwrap_or("unknown");
+    let serial = match card.ensure_token_serial() {
+        Ok(serial) => serial,
+        Err(_) => return CKR_DEVICE_ERROR,
+    };
     fill_blank(&mut info.serialNumber, serial.as_bytes());
     info.flags = CKF_TOKEN_INITIALIZED | CKF_LOGIN_REQUIRED | CKF_USER_PIN_INITIALIZED;
     info.ulMaxSessionCount = 8;
