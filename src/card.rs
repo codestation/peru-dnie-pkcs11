@@ -176,9 +176,13 @@ impl DnieCard {
 
     pub fn ensure_token_serial(&mut self) -> CardResult<&str> {
         if self.token_serial.is_none() {
-            let serial = self
-                .read_dni_serial()
-                .unwrap_or_else(|_| atr_serial_fallback(&self.atr));
+            let serial = if self.profile == Some(Profile::V3) {
+                self.ensure_signing_certificate()?;
+                certificate_token_serial(&self.certificate.der)
+            } else {
+                self.read_dni_serial()
+                    .unwrap_or_else(|_| atr_serial_fallback(&self.atr))
+            };
             self.token_serial = Some(serial);
         }
         Ok(self.token_serial.as_deref().unwrap_or("unknown"))
@@ -940,6 +944,15 @@ fn atr_serial_fallback(atr: &[u8]) -> String {
     }
 }
 
+fn certificate_token_serial(der: &[u8]) -> String {
+    // CK_TOKEN_INFO has room for 16 ASCII characters. Use a fingerprint
+    // instead of reading the national ID number from a separate card file.
+    Sha256::digest(der)[..8]
+        .iter()
+        .map(|byte| format!("{byte:02X}"))
+        .collect()
+}
+
 fn parse_cert_object(der: &[u8]) -> anyhow::Result<CertObject> {
     let cert = Certificate::from_der(der).context("decode X.509 certificate DER")?;
     let tbs = cert.tbs_certificate();
@@ -1274,6 +1287,14 @@ fn connect_http(host: &str, port: &str) -> anyhow::Result<TcpStream> {
 mod tests {
     use super::*;
     use num_bigint::BigUint;
+
+    #[test]
+    fn v3_token_serial_uses_cached_certificate_without_accessing_card() {
+        let mut card = DnieCard::default();
+        card.profile = Some(Profile::V3);
+        card.certificate.der = b"abc".to_vec();
+        assert_eq!(card.ensure_token_serial(), Ok("BA7816BF8F01CFEA"));
+    }
 
     const CKM_RSA_PKCS: u64 = 0x00000001;
     const CKM_SHA256_RSA_PKCS: u64 = 0x00000040;
